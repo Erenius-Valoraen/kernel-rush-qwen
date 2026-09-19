@@ -28,6 +28,7 @@ import torch.nn.functional as F
 from transformers import AutoModelForCausalLM
 
 from kernels.fused_attn import FusedDecodeAttention
+from kernels.mlp import PersistentMLP
 from kernels.gemv import gemv, gemv_m1, gemv_m1_swiglu, gemv_rows, gemv_swiglu
 from kernels.spec import accept as spec_accept, draft as spec_draft
 from kernels.ops import DecodeAttention, add_rmsnorm, qk_norm_rope_cache, silu_mul
@@ -244,6 +245,8 @@ class Engine:
         self.state = None
         self.host_buf = None
         self.gemm_plan = {}      # (name, M) -> implementation
+        self.pmlp = {}           # M -> PersistentMLP when it won tuning
+        self.attn_choice = {}    # prefill q shape -> SDPA variant
         self.rope_len = 0
         self._ensure_rope(8192)
 
@@ -330,9 +333,7 @@ class Engine:
                 q = qk_norm_rope_cache(qkv, L["qn"], L["kn"], self.cos, self.sin, kc, vc,
                                        st.zero_pos, S, b0, self.eps, nq, nkv, d)
                 q = q.view(g, S, nq, d).transpose(1, 2)
-                k = _repeat_kv(kc[b0:b0 + g, :, :S], nq // nkv).contiguous()
-                v = _repeat_kv(vc[b0:b0 + g, :, :S], nq // nkv).contiguous()
-                a = F.scaled_dot_product_attention(q, k, v, is_causal=True, scale=d ** -0.5)
+                a = self._prefill_attn(q, kc[b0:b0 + g, :, :S], vc[b0:b0 + g, :, :S])
                 a = a.transpose(1, 2).reshape(g * S, nq * d)
                 o = F.linear(a, L["o"])
                 h = add_rmsnorm(x, o, L["ln2"], self.eps)
@@ -342,6 +343,50 @@ class Engine:
             h = add_rmsnorm(xl, dl, self.final_norm, self.eps)
             logits = F.linear(h, self.lm_head)
             st.first[b0:b0 + g] = torch.argmax(logits, dim=-1)
+
+    def _prefill_attn(self, q, k, v):
+        """Causal GQA attention for prefill. The first call per shape times the
+        native-GQA SDPA path against explicit K/V expansion (the reference's
+        repeat_kv) and keeps the faster one if it agrees."""
+        rep = self.nq // self.nkv
+        scale = self.d ** -0.5
+
+        def expanded():
+            return F.scaled_dot_product_attention(
+                q, _repeat_kv(k, rep).contiguous(), _repeat_kv(v, rep).contiguous(),
+                is_causal=True, scale=scale)
+
+        def native():
+            return F.scaled_dot_product_attention(q, k, v, is_causal=True, scale=scale,
+                                                  enable_gqa=True)
+
+        key = tuple(q.shape)
+        choice = self.attn_choice.get(key)
+        if choice is None:
+            choice = "expanded"
+            if self.cuda and not torch.cuda.is_current_stream_capturing():
+                try:
+                    ref = expanded()
+                    got = native()
+                    if (got.float() - ref.float()).abs().max().item() < 0.02:
+                        ts = {}
+                        for name, fn in (("expanded", expanded), ("native", native)):
+                            fn()
+                            e0 = torch.cuda.Event(enable_timing=True)
+                            e1 = torch.cuda.Event(enable_timing=True)
+                            e0.record()
+                            for _ in range(3):
+                                fn()
+                            e1.record()
+                            e1.synchronize()
+                            ts[name] = e0.elapsed_time(e1)
+                        if ts["native"] < ts["expanded"]:
+                            choice = "native"
+                        _log(f"prefill attn {key}: {ts} -> {choice}")
+                except Exception as e:  # pragma: no cover
+                    _log(f"native GQA unavailable: {e!r}")
+                self.attn_choice[key] = choice
+        return native() if choice == "native" else expanded()
 
     def _forward_step(self, st, toks, pos, t, attn, use_gemv):
         """toks: [B*T] ids, sequence b's token j at position pos[b]+j. Returns argmax [B*T]."""
@@ -428,6 +473,42 @@ class Engine:
                     times.append(f"{cand}=ERR")
             self.gemm_plan[(name, M)] = best
             report.append(f"{name}:{best} ({' '.join(times)}us)")
+            if name == "gu":
+                gu_t = best_t
+            if name == "down":
+                sep_t = gu_t + best_t
+        # Persistent fused MLP vs the best separate gate/up + down pair.
+        self.gemm_plan[("mlp", M)] = "sep"
+        if self.cuda and M <= 16 and not self._late() and os.environ.get("ENGINE_NO_PMLP") != "1":
+            try:
+                H, I = self.layers[0]["down"].shape
+                pm = PersistentMLP(M, H, I, dev, self.num_sms)
+                hx = torch.randn((M, H), device=dev, dtype=torch.bfloat16) * 0.1
+                L0 = self.layers[0]
+                ref = F.linear(silu_mul(F.linear(hx, L0["gu"])), L0["down"]).float()
+                got = pm(hx, L0["gu"], L0["down"]).sum(0)
+                err = (got - ref).abs().max().item()
+                if err <= 0.02 * ref.abs().max().item() + 1e-3:
+                    self._sync()
+                    t_min = None
+                    for _ in range(3):
+                        e0 = torch.cuda.Event(enable_timing=True)
+                        e1 = torch.cuda.Event(enable_timing=True)
+                        e0.record()
+                        for L in self.layers:
+                            pm(hx, L["gu"], L["down"])
+                        e1.record()
+                        e1.synchronize()
+                        dt = e0.elapsed_time(e1) / len(self.layers)
+                        t_min = dt if t_min is None else min(t_min, dt)
+                    report.append(f"pmlp={t_min * 1e3:.0f}us vs sep={sep_t * 1e3:.0f}us")
+                    if t_min < sep_t:
+                        self.gemm_plan[("mlp", M)] = "pmlp"
+                        self.pmlp[M] = pm
+                else:
+                    report.append(f"pmlp=BAD({err:.3g})")
+            except Exception as e:  # pragma: no cover
+                report.append(f"pmlp=ERR {e!r}")
         _log(f"gemm plan M={M}: " + "; ".join(report))
 
     def _gemm(self, name, x, w):
@@ -442,7 +523,10 @@ class Engine:
             qkv = self._gemm("qkv", h, L["qkv"])
             a = self._attend(qkv, L, st.k_cache[li], st.v_cache[li], pos, t, attn)
             h = add_rmsnorm(x, self._gemm("o", a, L["o"]), L["ln2"], self.eps)
-            delta = self._gemm("down", self._gemm("gu", h, L["gu"]), L["down"])
+            if self.gemm_plan[("mlp", h.shape[0])] == "pmlp":
+                delta = self.pmlp[h.shape[0]](h, L["gu"], L["down"])
+            else:
+                delta = self._gemm("down", self._gemm("gu", h, L["gu"]), L["down"])
             nw = self.layers[li + 1]["ln1"] if li + 1 < n else self.final_norm
             h = add_rmsnorm(x, delta, nw, self.eps)
         logits = self._gemm("lm", h, self.lm_head)
