@@ -79,6 +79,8 @@ FP8_SITES = tuple(filter(None, re.split("[,:]", os.environ.get("ENGINE_FP8", "gu
 FP8_SKIP = tuple(int(v) for v in re.split("[,:]", os.environ.get("ENGINE_FP8_SKIP", "0:0")))   # leading, trailing bf16 layers
 FP8_DECODE = os.environ.get("ENGINE_FP8_DECODE", "1") == "1"   # gate/up + down in FP8 at decode, M >= 4
 FP8_DEC_SITES = tuple(re.split("[,:]", os.environ.get("ENGINE_FP8_DEC_SITES", "gu")))
+FP8_LM = os.environ.get("ENGINE_FP8_LM", "0") == "1"          # LM head in FP8 at decode
+FP8_SPEC_B1 = os.environ.get("ENGINE_FP8_SPEC_B1", "1") == "1"  # batch-1 verify steps use the fp8 plan
 FP8_DECODE_HEADROOM = float(os.environ.get("ENGINE_FP8_DECODE_HEADROOM", "2"))
 FP8_MIN_ROWS = int(os.environ.get("ENGINE_FP8_MIN_ROWS", "256"))
 DIAG = os.environ.get("ENGINE_DIAG", "0") == "1"      # telemetry-through-timing build
@@ -363,6 +365,8 @@ class Engine:
                             L[key + "8"] = quantize_weight(L[key])
                 fp8.pick_cast(_log)
                 self.fp8_ok = True
+                if FP8_LM:
+                    self.lm8 = quantize_weight(self.lm_head)
                 if FP8_DECODE:      # the last layer is trimmed in prefill: no scales for it
                     self.fp8_dec_layers = set(range(self.n_layers - 1))
             except Exception as e:  # pragma: no cover
@@ -844,7 +848,7 @@ class Engine:
                 delta = gemv(gemv_swiglu(h, L["gu"]), L["down"], SPLIT_DOWN)
             nw = self.layers[li + 1]["ln1"] if li + 1 < n else self.final_norm
             h = add_rmsnorm(x, delta, nw, self.eps)
-        logits = gemv(h, self.lm_head, 1)
+        logits = linear_fp8(h, self.lm8) if FP8_LM else gemv(h, self.lm_head, 1)
         return torch.argmax(logits, dim=-1)
 
     def _forward_step_gemv(self, st, toks, pos, t, attn, plan_name):
@@ -1100,10 +1104,11 @@ class Engine:
                 and os.environ.get("ENGINE_SPEC_ALWAYS", "1") == "1"):
             try:
                 t_spec = 8 if n >= 192 else 4      # longer outputs repeat more: deeper drafts pay
-                st.runner(self, t_spec, best[1])
-                for _ in self._spec(st, ids, input_ids, S, n, t_spec, best[1]):
+                plan = "fp8" if (self.fp8_dec_layers and FP8_SPEC_B1) else best[1]
+                st.runner(self, t_spec, plan)
+                for _ in self._spec(st, ids, input_ids, S, n, t_spec, plan):
                     pass
-                best = (t_spec, best[1])
+                best = (t_spec, plan)
             except Exception as e:  # pragma: no cover
                 _log(f"always-on spec unavailable: {e!r}")
         force = os.environ.get("ENGINE_FORCE_PLAN")
