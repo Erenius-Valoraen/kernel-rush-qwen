@@ -48,6 +48,7 @@ from transformers import AutoModelForCausalLM
 from kernels.fused_attn import FusedDecodeAttention
 from kernels.mega import MegaDecode
 from kernels.mlp import PersistentMLP
+from kernels.prefill_mlp import gu_swiglu
 from kernels.gemv import gemv, gemv_m1, gemv_m1_swiglu, gemv_rows, gemv_swiglu, gemv_tma
 from kernels.spec import accept as spec_accept, draft as spec_draft
 from kernels.ops import DecodeAttention, add_rmsnorm, qk_norm_rope_cache, silu_mul
@@ -296,6 +297,7 @@ class Engine:
         self.gemm_plan = {}      # (name, M) -> implementation
         self.pmlp = {}           # M -> PersistentMLP when it won tuning
         self.attn_choice = {}    # prefill q shape -> SDPA variant
+        self.gu_choice = {}      # prefill h shape -> gate/up implementation
         self.rope_len = 0
         self._ensure_rope(8192)
 
@@ -408,12 +410,48 @@ class Engine:
                 a = a.transpose(1, 2).reshape(g * S, nq * d)
                 o = F.linear(a, L["o"])
                 h = add_rmsnorm(x, o, L["ln2"], self.eps)
-                delta = F.linear(silu_mul(F.linear(h, L["gu"])), L["down"])
+                delta = F.linear(self._prefill_gu(h, L["gu"]), L["down"])
             xl = x.view(g, S, -1)[:, -1].contiguous()
             dl = delta.view(g, S, -1)[:, -1].contiguous()
             h = add_rmsnorm(xl, dl, self.final_norm, self.eps)
             logits = F.linear(h, self.lm_head)
             st.first[b0:b0 + g] = torch.argmax(logits, dim=-1)
+
+    def _prefill_gu(self, h, w):
+        """SwiGLU(h @ [Wg; Wu]^T) for prefill: cuBLAS + separate SiLU kernel, or
+        a Triton matmul with the SwiGLU epilogue fused, whichever validates
+        and measures faster on the first call per shape."""
+        key = tuple(h.shape)
+        choice = self.gu_choice.get(key)
+        if choice is None:
+            choice = "cublas"
+            if (self.cuda and not torch.cuda.is_current_stream_capturing()
+                    and os.environ.get("ENGINE_NO_PF_GU") != "1" and not self._late()):
+                try:
+                    ref = silu_mul(F.linear(h, w)).float()
+                    got = gu_swiglu(h, w).float()
+                    err = (got - ref).abs().max().item()
+                    if err <= 0.02 * ref.abs().max().item() + 1e-3:
+                        ts = {}
+                        for name, fn in (("cublas", lambda: silu_mul(F.linear(h, w))),
+                                         ("triton", lambda: gu_swiglu(h, w))):
+                            fn()
+                            e0 = torch.cuda.Event(enable_timing=True)
+                            e1 = torch.cuda.Event(enable_timing=True)
+                            e0.record()
+                            for _ in range(3):
+                                fn()
+                            e1.record()
+                            e1.synchronize()
+                            ts[name] = e0.elapsed_time(e1)
+                        choice = min(ts, key=ts.get)
+                        _log(f"prefill gate/up {key}: {ts} -> {choice}")
+                    else:
+                        _log(f"prefill gate/up triton mismatch {err:.3g}")
+                except Exception as e:  # pragma: no cover
+                    _log(f"prefill gate/up triton unavailable: {e!r}")
+            self.gu_choice[key] = choice
+        return gu_swiglu(h, w) if choice == "triton" else silu_mul(F.linear(h, w))
 
     def _prefill_attn(self, q, k, v):
         """Causal GQA attention for prefill. The first call per shape times the
