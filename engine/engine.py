@@ -818,7 +818,7 @@ class Engine:
         gemv_ok = self.cuda and os.environ.get("ENGINE_NO_GEMV") != "1"
         modes = [(1, False)]
         if self.mega_ok and B <= 16 and n >= 4:
-            for plan in filter(None, os.environ.get("ENGINE_MEGA_PLANS", "mega").split(",")):
+            for plan in filter(None, os.environ.get("ENGINE_MEGA_PLANS", "").split(",")):
                 if not self._late() and self._mega_matches(st, ids, S, plan=plan):
                     modes.append((1, plan))
         if gemv_ok and B <= GEMV_MAX_M:
@@ -864,7 +864,7 @@ class Engine:
                 # speculative modes reuse the best plain matmul plan
                 pending = [(ts, best[1]) for ts in spec_ts]
                 spec_ts = []
-        force = os.environ.get("ENGINE_FORCE_PLAN", "mega")   # EXPERIMENT
+        force = os.environ.get("ENGINE_FORCE_PLAN")
         if force and (1, force) in modes:
             best = (1, force)
         st.mode = best
