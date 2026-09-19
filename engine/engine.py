@@ -159,6 +159,10 @@ class _State:
         self.zero_pos = torch.zeros((batch,), device=dev, dtype=torch.int32)
         self.first = torch.zeros((batch,), device=dev, dtype=torch.int64)
         self.runners = {}
+        self.pf_len = None        # prompt length the prefill graph was captured for
+        self.pf_graph = None
+        self.pf_ids = None
+        self.pf_runs = 0
         self.mode = None          # chosen (T, use_gemv) for this shape
 
     def runner(self, eng, t, use_gemv):
@@ -258,7 +262,38 @@ class Engine:
     # ---------------------------------------------------------------- forward
 
     def _prefill(self, ids, st):
-        """ids: [B, S] on device. Fills the cache, writes first tokens to st.first."""
+        """ids: [B, S] on device. Fills the cache, writes first tokens to st.first.
+
+        The first run for a prompt length is eager (compiles kernels); the
+        second captures a CUDA graph that later calls replay."""
+        S = ids.shape[1]
+        if not self.use_graphs:
+            return self._prefill_eager(ids, st)
+        if st.pf_len != S:
+            st.pf_len, st.pf_graph, st.pf_runs = S, None, 0
+            st.pf_ids = torch.empty_like(ids)
+        if st.pf_graph is not None:
+            st.pf_ids.copy_(ids)
+            st.pf_graph.replay()
+            return
+        st.pf_runs += 1
+        if st.pf_runs < 2:
+            return self._prefill_eager(ids, st)
+        try:
+            st.pf_ids.copy_(ids)
+            torch.cuda.synchronize()
+            g = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(g):
+                self._prefill_eager(st.pf_ids, st)
+            torch.cuda.synchronize()
+            st.pf_graph = g
+            g.replay()
+        except Exception as e:  # pragma: no cover
+            _log(f"prefill graph capture failed: {e!r}")
+            st.pf_runs = -10 ** 9
+            self._prefill_eager(ids, st)
+
+    def _prefill_eager(self, ids, st):
         B, S = ids.shape
         per = max(1, PREFILL_TOKENS // S)
         nq, nkv, d = self.nq, self.nkv, self.d
