@@ -60,6 +60,7 @@ SPEC_MARGIN = 0.85         # speculative must beat plain by 15% on warmup
 GEMV_MAX_M = 128           # Triton skinny GEMMs up to this many rows
 SPLIT_QKV, SPLIT_O, SPLIT_DOWN = 2, 4, 4
 CALIBRATION_BUDGET_S = 150.0
+CALIB_REPS = 4                # timed repetitions per decode mode (min taken)
 WARMUP_DEADLINE_S = 180.0     # since __init__ began; the platform allows 300
 FUSED_ATTN = os.environ.get("ENGINE_UNFUSED_ATTN") != "1"
 
@@ -840,7 +841,8 @@ class Engine:
             try:
                 st.runner(self, t, g)
                 stats = {}
-                for rep in range(2):             # first pass warms caches
+                dts = []
+                for rep in range(CALIB_REPS + 1):   # first pass warms caches
                     self._sync()
                     t0 = time.perf_counter()
                     stats = {}
@@ -851,7 +853,9 @@ class Engine:
                     for _ in gen:
                         pass
                     self._sync()
-                    dt = time.perf_counter() - t0
+                    if rep:
+                        dts.append(time.perf_counter() - t0)
+                dt = min(dts)                       # least-disturbed sample
                 eff = dt if t == 1 else dt / SPEC_MARGIN
                 acc = (f" acc/step={stats['accepted'] / max(1, stats['steps']) / B:.2f}"
                        if stats else "")
