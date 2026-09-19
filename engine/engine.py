@@ -77,7 +77,7 @@ LAST_LAYER_TRIM = os.environ.get("ENGINE_NO_TRIM") != "1"
 # prefill GEMMs run in FP8 (organisers allow FP8 compute); decode stays bf16
 FP8_SITES = tuple(filter(None, re.split("[,:]", os.environ.get("ENGINE_FP8", "gu"))))
 FP8_SKIP = tuple(int(v) for v in re.split("[,:]", os.environ.get("ENGINE_FP8_SKIP", "0:0")))   # leading, trailing bf16 layers
-FP8_DECODE = os.environ.get("ENGINE_FP8_DECODE", "1") == "1"   # gate/up + down in FP8 at decode, M >= 4
+FP8_DECODE = os.environ.get("ENGINE_FP8_DECODE", "0") == "1"   # gate/up + down in FP8 at decode, M >= 4
 FP8_MIN_ROWS = int(os.environ.get("ENGINE_FP8_MIN_ROWS", "256"))
 DIAG = os.environ.get("ENGINE_DIAG", "0") == "1"      # telemetry-through-timing build
 
@@ -511,22 +511,15 @@ class Engine:
         """First eager prefill: keep this site's activation scale for the FP8 decode plan."""
         if (self.fp8_ok and FP8_DECODE and (li, key) not in self.fp8_act
                 and not torch.cuda.is_current_stream_capturing()):
-            self.fp8_act[(li, key)] = ActScale(x)
+            self.fp8_act[(li, key)] = ActScale(x, 4.0)
 
     def _pf_fp8(self, x, key, li):
         return (self.fp8_ok and key in FP8_SITES and x.shape[0] >= FP8_MIN_ROWS
                 and FP8_SKIP[0] <= li < self.n_layers - FP8_SKIP[1])
 
     def _pf_linear(self, x, li, key):
-        """Prefill GEMM in FP8. The site's activation scale is measured on the
-        first eager pass and static afterwards (graph-safe, no sync)."""
-        L = self.layers[li]
-        a = self.fp8_act.get((li, key))
-        if a is None:
-            if torch.cuda.is_current_stream_capturing():
-                return F.linear(x, L[key])
-            a = self.fp8_act[(li, key)] = ActScale(x)
-        return linear_fp8(x, L[key + "8"], a)
+        """Prefill GEMM in FP8, activation scaled by its own range."""
+        return linear_fp8(x, self.layers[li][key + "8"])
 
     def _prefill_gu(self, h, w):
         """SwiGLU(h @ [Wg; Wu]^T) for prefill: cuBLAS + separate SiLU kernel, or

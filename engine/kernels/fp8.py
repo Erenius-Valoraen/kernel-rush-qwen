@@ -1,9 +1,7 @@
 """FP8 (e4m3) prefill GEMMs through cuBLASLt (torch._scaled_mm).
 
-Weights get one scale per matrix. Activations use one static scale per site,
-measured on the first (warmup) prefill with headroom: e4m3 is floating point,
-so headroom costs no precision, and values are clamped to the finite range.
-One fused kernel scales, clamps and casts. Decode stays on the bf16 kernels.
+Weights get one scale per matrix. Prefill activations use one dynamic scale per call (their own range, so
+nothing is ever clamped); one fused kernel scales and casts. Decode stays on the bf16 kernels.
 """
 
 import os
@@ -26,12 +24,14 @@ def quantize_weight(w):
 
 
 class ActScale:
-    """Static activation scale for one site: x8 = clamp(x * inv), x ~= x8 * scale."""
+    """Activation scale for one call: x8 = clamp(x * inv), x ~= x8 * scale.
+    Computed on device from this tensor's own range (no sync, graph-safe)."""
 
-    def __init__(self, x):
-        amax = x.abs().max().float().clamp_min(1e-6) * HEADROOM
+    def __init__(self, x, headroom=1.0):
+        mn, mx = torch.aminmax(x)
+        amax = torch.maximum(-mn, mx).float().clamp_min(1e-6) * headroom
         self.inv = (FP8_MAX / amax).reshape(1)             # fp32, on device
-        self.scale = (1.0 / self.inv).reshape(())
+        self.scale = (amax / FP8_MAX).reshape(())
 
 
 @triton.jit
@@ -86,8 +86,11 @@ def pick_cast(log):
         log(f"fp8 triton cast unavailable: {e!r}")
 
 
-def linear_fp8(x, q, a):
-    """bf16 [M, N] ~= x @ W^T with q = quantize_weight(W), a = ActScale for this site."""
+def linear_fp8(x, q, a=None):
+    """bf16 [M, N] ~= x @ W^T with q = quantize_weight(W); a = static ActScale, or
+    None to scale by this tensor's own range."""
     w8, ws = q
+    if a is None:
+        a = ActScale(x)
     return torch._scaled_mm(_cast(x, a), w8.t(), scale_a=a.scale, scale_b=ws,
                             out_dtype=torch.bfloat16)
