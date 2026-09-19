@@ -24,15 +24,28 @@ _DOT_F32 = os.environ.get("TRITON_INTERPRET") == "1"
 
 
 @triton.jit
-def _add_rmsnorm_kernel(x_ptr, d_ptr, w_ptr, y_ptr, n_cols, eps,
-                        HAS_DELTA: tl.constexpr, BLOCK: tl.constexpr):
+def _load_rows(ptr, offs, mask, NSPLIT: tl.constexpr, split_stride):
+    """bf16 row, or the bf16 rounding of the sum of NSPLIT fp32 partial rows."""
+    if NSPLIT == 0:
+        v = tl.load(ptr + offs, mask=mask, other=0.0)
+    else:
+        acc = tl.load(ptr + offs, mask=mask, other=0.0)
+        for s in tl.static_range(1, NSPLIT):
+            acc += tl.load(ptr + s * split_stride + offs, mask=mask, other=0.0)
+        v = acc.to(tl.bfloat16)
+    return v
+
+
+@triton.jit
+def _add_rmsnorm_kernel(x_ptr, d_ptr, w_ptr, y_ptr, n_cols, split_stride, eps,
+                        HAS_DELTA: tl.constexpr, DSPLIT: tl.constexpr, BLOCK: tl.constexpr):
     row = tl.program_id(0).to(tl.int64)
     cols = tl.arange(0, BLOCK)
     mask = cols < n_cols
     offs = row * n_cols + cols
     x = tl.load(x_ptr + offs, mask=mask, other=0.0)
     if HAS_DELTA:
-        d = tl.load(d_ptr + offs, mask=mask, other=0.0)
+        d = _load_rows(d_ptr, offs, mask, DSPLIT, split_stride)
         x = (x.to(tl.float32) + d.to(tl.float32)).to(tl.bfloat16)
         tl.store(x_ptr + offs, x, mask=mask)
     xf = x.to(tl.float32)
@@ -44,12 +57,16 @@ def _add_rmsnorm_kernel(x_ptr, d_ptr, w_ptr, y_ptr, n_cols, eps,
 
 
 def add_rmsnorm(x, delta, weight, eps):
-    """If delta is given: x += delta (in place, bf16). Returns rmsnorm(x)*w."""
+    """If delta is given: x += delta (in place, bf16). Returns rmsnorm(x)*w.
+
+    delta may be a bf16 [M, N] tensor or fp32 split-K partials [S, M, N]."""
     M, N = x.shape
     y = torch.empty_like(x)
+    dsplit = delta.shape[0] if delta is not None and delta.dim() == 3 else 0
     _add_rmsnorm_kernel[(M,)](
-        x, delta if delta is not None else x, weight, y, N, eps,
-        HAS_DELTA=delta is not None, BLOCK=triton.next_power_of_2(N), num_warps=8,
+        x, delta if delta is not None else x, weight, y, N, M * N, eps,
+        HAS_DELTA=delta is not None, DSPLIT=dsplit,
+        BLOCK=triton.next_power_of_2(N), num_warps=8,
     )
     return y
 
@@ -57,29 +74,30 @@ def add_rmsnorm(x, delta, weight, eps):
 # ---------------------------------------------------------------------------
 # Per-head Q/K RMSNorm + RoPE, K/V written straight into the cache.
 #
-# qkv: [M, (NQ + 2*NKV) * D] rows; row r belongs to sequence b0 + r // S at
-# position pos0 + r % S (pos0 read from a device pointer so a CUDA graph can
-# replay it at a new position).
+# qkv: [M, (NQ + 2*NKV) * D] rows; row r belongs to sequence b = b0 + r // S
+# at position pos[b] + r % S (pos is a per-sequence device vector so a CUDA
+# graph can replay it at new positions).
 # ---------------------------------------------------------------------------
 
 
 @triton.jit
 def _qk_norm_rope_kernel(qkv_ptr, qw_ptr, kw_ptr, cos_ptr, sin_ptr, q_out_ptr,
                          kc_ptr, vc_ptr, pos_ptr, S, b0,
-                         stride_cb, stride_ch, eps,
-                         NQ: tl.constexpr, NKV: tl.constexpr, D: tl.constexpr):
+                         stride_cb, stride_ch, split_stride, eps,
+                         NQ: tl.constexpr, NKV: tl.constexpr, D: tl.constexpr,
+                         QSPLIT: tl.constexpr):
     row = tl.program_id(0)
     head = tl.program_id(1)
     HALF: tl.constexpr = D // 2
     b = b0 + row // S
-    pos = tl.load(pos_ptr) + row % S
+    pos = tl.load(pos_ptr + b) + row % S
     row64 = row.to(tl.int64)
     src = qkv_ptr + row64 * ((NQ + 2 * NKV) * D) + head * D
     offs = tl.arange(0, HALF)
 
     if head < NQ + NKV:
-        x1 = tl.load(src + offs).to(tl.float32)
-        x2 = tl.load(src + HALF + offs).to(tl.float32)
+        x1 = _load_rows(src, offs, offs < HALF, QSPLIT, split_stride).to(tl.float32)
+        x2 = _load_rows(src + HALF, offs, offs < HALF, QSPLIT, split_stride).to(tl.float32)
         var = (tl.sum(x1 * x1, axis=0) + tl.sum(x2 * x2, axis=0)) / D
         rstd = tl.math.rsqrt(var + eps)
         if head < NQ:
@@ -108,8 +126,8 @@ def _qk_norm_rope_kernel(qkv_ptr, qw_ptr, kw_ptr, cos_ptr, sin_ptr, q_out_ptr,
         tl.store(dst + offs, o1)
         tl.store(dst + HALF + offs, o2)
     else:
-        v1 = tl.load(src + offs)
-        v2 = tl.load(src + HALF + offs)
+        v1 = _load_rows(src, offs, offs < HALF, QSPLIT, split_stride)
+        v2 = _load_rows(src + HALF, offs, offs < HALF, QSPLIT, split_stride)
         dst = vc_ptr + b.to(tl.int64) * stride_cb + (head - NQ - NKV) * stride_ch + pos.to(tl.int64) * D
         tl.store(dst + offs, v1)
         tl.store(dst + HALF + offs, v2)
@@ -117,13 +135,15 @@ def _qk_norm_rope_kernel(qkv_ptr, qw_ptr, kw_ptr, cos_ptr, sin_ptr, q_out_ptr,
 
 def qk_norm_rope_cache(qkv, q_w, k_w, cos, sin, k_cache, v_cache, pos_t, S, b0,
                        eps, nq, nkv, d):
-    """k_cache/v_cache: [B, NKV, CAP, D] views for one layer."""
-    M = qkv.shape[0]
-    q_out = torch.empty((M, nq * d), device=qkv.device, dtype=qkv.dtype)
+    """k_cache/v_cache: [B, NKV, CAP, D] views for one layer. qkv is bf16
+    [M, W] or fp32 split-K partials [S, M, W]."""
+    qsplit = qkv.shape[0] if qkv.dim() == 3 else 0
+    M, W = qkv.shape[-2], qkv.shape[-1]
+    q_out = torch.empty((M, nq * d), device=qkv.device, dtype=torch.bfloat16)
     _qk_norm_rope_kernel[(M, nq + 2 * nkv)](
         qkv, q_w, k_w, cos, sin, q_out, k_cache, v_cache, pos_t, S, b0,
-        k_cache.stride(0), k_cache.stride(1), eps,
-        NQ=nq, NKV=nkv, D=d, num_warps=1,
+        k_cache.stride(0), k_cache.stride(1), M * W, eps,
+        NQ=nq, NKV=nkv, D=d, QSPLIT=qsplit, num_warps=1,
     )
     return q_out
 
@@ -154,34 +174,41 @@ def silu_mul(gu):
 
 
 # ---------------------------------------------------------------------------
-# Split-K grouped-query decode attention over a fixed-capacity cache, reading
-# the valid length (pos + 1) from device memory so CUDA graphs can replay it.
+# Split-K grouped-query attention of T new tokens per sequence against a
+# fixed-capacity cache. Token j of sequence b sits at position pos[b] + j and
+# sees keys 0..pos[b]+j (causal). T=1 is plain decode; T>1 verifies drafts.
+# Positions are read from device memory so CUDA graphs can replay the call.
 # ---------------------------------------------------------------------------
 
 
 @triton.jit
 def _decode_attn_kernel(q_ptr, kc_ptr, vc_ptr, o_ptr, m_ptr, l_ptr, pos_ptr,
                         stride_cb, stride_ch, scale, CHUNK,
-                        NKV: tl.constexpr, GROUP: tl.constexpr, GPAD: tl.constexpr,
-                        D: tl.constexpr, BLOCK_N: tl.constexpr, NSPLIT: tl.constexpr,
-                        DOT_F32: tl.constexpr):
+                        NKV: tl.constexpr, GROUP: tl.constexpr, T: tl.constexpr,
+                        RPAD: tl.constexpr, D: tl.constexpr, BLOCK_N: tl.constexpr,
+                        NSPLIT: tl.constexpr, DOT_F32: tl.constexpr):
     pid = tl.program_id(0)
     split = tl.program_id(1)
     b = pid // NKV
     kvh = pid % NKV
-    seq_len = tl.load(pos_ptr) + 1
+    ROWS: tl.constexpr = GROUP * T
+    NQ: tl.constexpr = NKV * GROUP
+    p0 = tl.load(pos_ptr + b)
     start = split * CHUNK
-    end = tl.minimum(start + CHUNK, seq_len)
+    end = tl.minimum(start + CHUNK, p0 + T)
 
-    offs_g = tl.arange(0, GPAD)
+    offs_r = tl.arange(0, RPAD)
     offs_d = tl.arange(0, D)
-    gmask = offs_g < GROUP
-    q = tl.load(q_ptr + b * (NKV * GROUP * D) + (kvh * GROUP + offs_g)[:, None] * D + offs_d[None, :],
-                mask=gmask[:, None], other=0.0)
+    rmask = offs_r < ROWS
+    j = offs_r // GROUP
+    g = offs_r % GROUP
+    limit = p0 + j                       # last key each row may see
+    q = tl.load(q_ptr + ((b * T + j) * NQ + kvh * GROUP + g)[:, None] * D + offs_d[None, :],
+                mask=rmask[:, None], other=0.0)
 
-    m_i = tl.full([GPAD], float("-inf"), tl.float32)
-    l_i = tl.zeros([GPAD], tl.float32)
-    acc = tl.zeros([GPAD, D], tl.float32)
+    m_i = tl.full([RPAD], float("-inf"), tl.float32)
+    l_i = tl.zeros([RPAD], tl.float32)
+    acc = tl.zeros([RPAD, D], tl.float32)
     base = b.to(tl.int64) * stride_cb + kvh * stride_ch
     for n0 in range(start, end, BLOCK_N):
         offs_n = n0 + tl.arange(0, BLOCK_N)
@@ -192,10 +219,12 @@ def _decode_attn_kernel(q_ptr, kc_ptr, vc_ptr, o_ptr, m_ptr, l_ptr, pos_ptr,
             s = tl.dot(q.to(tl.float32), tl.trans(k.to(tl.float32))) * scale
         else:
             s = tl.dot(q, tl.trans(k)) * scale
-        s = tl.where(nmask[None, :], s, float("-inf"))
+        valid = nmask[None, :] & (offs_n[None, :] <= limit[:, None])
+        s = tl.where(valid, s, float("-inf"))
         m_new = tl.maximum(m_i, tl.max(s, axis=1))
-        alpha = tl.exp(m_i - m_new)
-        p = tl.exp(s - m_new[:, None])
+        m_safe = tl.where(m_new == float("-inf"), 0.0, m_new)
+        alpha = tl.exp(m_i - m_safe)
+        p = tl.exp(s - m_safe[:, None])
         l_i = l_i * alpha + tl.sum(p, axis=1)
         v = tl.load(vc_ptr + kv_offs, mask=nmask[:, None], other=0.0)
         if DOT_F32:
@@ -205,24 +234,28 @@ def _decode_attn_kernel(q_ptr, kc_ptr, vc_ptr, o_ptr, m_ptr, l_ptr, pos_ptr,
         acc = acc * alpha[:, None] + pv
         m_i = m_new
 
-    part = (pid * NSPLIT + split) * GROUP
-    tl.store(m_ptr + part + offs_g, m_i, mask=gmask)
-    tl.store(l_ptr + part + offs_g, l_i, mask=gmask)
-    tl.store(o_ptr + (part + offs_g)[:, None] * D + offs_d[None, :], acc, mask=gmask[:, None])
+    part = (pid * NSPLIT + split) * ROWS
+    tl.store(m_ptr + part + offs_r, m_i, mask=rmask)
+    tl.store(l_ptr + part + offs_r, l_i, mask=rmask)
+    tl.store(o_ptr + (part + offs_r)[:, None] * D + offs_d[None, :], acc, mask=rmask[:, None])
 
 
 @triton.jit
 def _decode_combine_kernel(o_ptr, m_ptr, l_ptr, out_ptr,
-                           NKV: tl.constexpr, GROUP: tl.constexpr, D: tl.constexpr,
-                           NSPLIT: tl.constexpr, SPAD: tl.constexpr):
-    pid = tl.program_id(0)          # b * NQ + head
-    b = pid // (NKV * GROUP)
-    head = pid % (NKV * GROUP)
+                           NKV: tl.constexpr, GROUP: tl.constexpr, T: tl.constexpr,
+                           D: tl.constexpr, NSPLIT: tl.constexpr, SPAD: tl.constexpr):
+    pid = tl.program_id(0)          # (b * T + j) * NQ + head
+    NQ: tl.constexpr = NKV * GROUP
+    ROWS: tl.constexpr = GROUP * T
+    tok = pid // NQ
+    head = pid % NQ
+    b = tok // T
+    j = tok % T
     kvh = head // GROUP
-    g = head % GROUP
+    r = j * GROUP + head % GROUP
     offs_s = tl.arange(0, SPAD)
     smask = offs_s < NSPLIT
-    idx = ((b * NKV + kvh) * NSPLIT + offs_s) * GROUP + g
+    idx = ((b * NKV + kvh) * NSPLIT + offs_s) * ROWS + r
     m = tl.load(m_ptr + idx, mask=smask, other=float("-inf"))
     l = tl.load(l_ptr + idx, mask=smask, other=0.0)
     m_max = tl.max(m, axis=0)
@@ -235,36 +268,40 @@ def _decode_combine_kernel(o_ptr, m_ptr, l_ptr, out_ptr,
 
 
 class DecodeAttention:
-    """Preallocated split-K workspace for one (batch, capacity) shape."""
+    """Preallocated split-K workspace for one (batch, T, capacity) shape."""
 
     BLOCK_N = 64
 
-    def __init__(self, batch, capacity, nq, nkv, d, device, num_sms):
-        self.batch, self.nq, self.nkv, self.d = batch, nq, nkv, d
+    def __init__(self, batch, t, capacity, nq, nkv, d, device, num_sms):
+        self.batch, self.t, self.nq, self.nkv, self.d = batch, t, nq, nkv, d
         self.group = nq // nkv
         nblocks = triton.cdiv(capacity, self.BLOCK_N)
         target = max(1, triton.cdiv(2 * num_sms, batch * nkv))
         nsplit = max(1, min(nblocks, target))
         self.chunk = triton.cdiv(nblocks, nsplit) * self.BLOCK_N
         self.nsplit = triton.cdiv(capacity, self.chunk)
-        parts = batch * nkv * self.nsplit * self.group
+        rows = self.group * t
+        self.rpad = max(16, triton.next_power_of_2(rows))
+        parts = batch * nkv * self.nsplit * rows
         self.o = torch.empty((parts, d), device=device, dtype=torch.float32)
         self.m = torch.empty((parts,), device=device, dtype=torch.float32)
         self.l = torch.empty((parts,), device=device, dtype=torch.float32)
         self.scale = d ** -0.5
 
     def __call__(self, q, k_cache, v_cache, pos_t):
-        B = self.batch
-        out = torch.empty((B, self.nq * self.d), device=q.device, dtype=q.dtype)
+        """q: [B*T, NQ*D]; pos_t: [B] int32 position of each sequence's first new token."""
+        B, T = self.batch, self.t
+        out = torch.empty((B * T, self.nq * self.d), device=q.device, dtype=q.dtype)
         _decode_attn_kernel[(B * self.nkv, self.nsplit)](
             q, k_cache, v_cache, self.o, self.m, self.l, pos_t,
             k_cache.stride(0), k_cache.stride(1), self.scale, self.chunk,
-            NKV=self.nkv, GROUP=self.group, GPAD=16, D=self.d,
-            BLOCK_N=self.BLOCK_N, NSPLIT=self.nsplit, DOT_F32=_DOT_F32, num_warps=4, num_stages=2,
+            NKV=self.nkv, GROUP=self.group, T=T, RPAD=self.rpad, D=self.d,
+            BLOCK_N=self.BLOCK_N, NSPLIT=self.nsplit, DOT_F32=_DOT_F32,
+            num_warps=4, num_stages=2,
         )
-        _decode_combine_kernel[(B * self.nq,)](
+        _decode_combine_kernel[(B * T * self.nq,)](
             self.o, self.m, self.l, out,
-            NKV=self.nkv, GROUP=self.group, D=self.d, NSPLIT=self.nsplit,
+            NKV=self.nkv, GROUP=self.group, T=T, D=self.d, NSPLIT=self.nsplit,
             SPAD=max(2, triton.next_power_of_2(self.nsplit)), num_warps=2,
         )
         return out
