@@ -86,7 +86,7 @@ LAST_LAYER_TRIM = os.environ.get("ENGINE_NO_TRIM") != "1"
 # prefill GEMMs run in FP8 (organisers allow FP8 compute); decode stays bf16
 FP8_SITES = tuple(filter(None, re.split("[,:]", os.environ.get("ENGINE_FP8", "gu"))))
 FP8_SKIP = tuple(int(v) for v in re.split("[,:]", os.environ.get("ENGINE_FP8_SKIP", "0:0")))   # leading, trailing bf16 layers
-FP8_DECODE = os.environ.get("ENGINE_FP8_DECODE", "1") == "1"   # gate/up + down in FP8 at decode, M >= 4
+FP8_DECODE = os.environ.get("ENGINE_FP8_DECODE", "0") == "1"   # gate/up + down in FP8 at decode, M >= 4
 FP8_DEC_SITES = tuple(re.split("[,:]", os.environ.get("ENGINE_FP8_DEC_SITES", "gu")))
 FP8_LM = os.environ.get("ENGINE_FP8_LM", "0") == "1"          # LM head in FP8 at decode
 FP8_SPEC_B1 = os.environ.get("ENGINE_FP8_SPEC_B1", "1") == "1"  # batch-1 verify steps use the fp8 plan
