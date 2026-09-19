@@ -65,7 +65,7 @@ CALIBRATION_BUDGET_S = 150.0
 CALIB_REPS = 4                # timed repetitions per decode mode (min taken)
 WARMUP_DEADLINE_S = 180.0     # since __init__ began; the platform allows 300
 FUSED_ATTN = os.environ.get("ENGINE_UNFUSED_ATTN") != "1"
-DIAG = os.environ.get("ENGINE_DIAG", "1") == "1"      # telemetry-through-timing build
+DIAG = os.environ.get("ENGINE_DIAG", "0") == "1"      # telemetry-through-timing build
 
 
 def _log(msg):
@@ -887,7 +887,9 @@ class Engine:
                     modes += [(1, "fixedpdlpf")]
             if self.pdl_ok and n >= 4 and not self._late()                     and self._mega_matches(st, ids, S, steps=8, plan="fusedpdl", ref="fixed"):
                 modes += [(1, "fusedpdl")]
-            if os.environ.get("ENGINE_TUNED", "1") == "1":
+            if not self._late() and self._mega_matches(st, ids, S, steps=8, plan="fused", ref="fixed"):
+                modes += [(1, "fused")]
+            if os.environ.get("ENGINE_TUNED", "0") == "1":   # never won calibration (telemetry run)
                 modes += [(1, "tuned")]
                 if self.pdl_ok and n >= 4 and not self._late():
                     modes += [(1, "tunedpdl")]
