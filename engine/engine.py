@@ -50,6 +50,7 @@ from kernels import pdl
 from kernels.mega import MegaDecode
 from kernels.mlp import PersistentMLP
 from kernels.prefill_mlp import gu_swiglu
+from kernels.fused_gemv import FusedLayerBuffers, gemv_fused, gemv_swiglu_fused
 from kernels.gemv import gemv, gemv_m1, gemv_m1_swiglu, gemv_rows, gemv_swiglu, gemv_tma
 from kernels.spec import accept as spec_accept, draft as spec_draft
 from kernels.ops import DecodeAttention, add_rmsnorm, qk_norm_rope_cache, silu_mul
@@ -160,6 +161,10 @@ class _Runner:
         self.graph = None
         if use_gemv in ("tuned", "tunedpdl"):
             eng._tune_gemms(B * t)
+        if use_gemv in ("fused", "fusedpdl"):
+            M = B * t
+            if M not in eng.fused_bufs:
+                eng.fused_bufs[M] = FusedLayerBuffers(M, eng.embed.shape[1], eng.lm_head.shape[0], dev)
 
     def step(self, eng, st):
         if self.mega is not None:
@@ -217,7 +222,7 @@ class _Runner:
                 self.step(eng, st)
         torch.cuda.current_stream().wait_stream(s)
         torch.cuda.synchronize()
-        pdl.set_active(self.use_gemv in ("fixedpdl", "fixedpdlpf", "tunedpdl", "fixedpdlpeel"))
+        pdl.set_active(self.use_gemv in ("fixedpdl", "fixedpdlpf", "tunedpdl", "fixedpdlpeel", "fusedpdl"))
         try:
             g = torch.cuda.CUDAGraph()
             with torch.cuda.graph(g):
@@ -336,6 +341,7 @@ class Engine:
         self.host_buf = None
         self.gemm_plan = {}      # (name, M) -> implementation
         self.pmlp = {}           # M -> PersistentMLP when it won tuning
+        self.fused_bufs = {}     # M -> FusedLayerBuffers
         self.attn_choice = {}    # prefill q shape -> SDPA variant
         self.gu_choice = {}      # prefill h shape -> gate/up implementation
         self.rope_len = 0
@@ -671,8 +677,34 @@ class Engine:
                 report.append(f"pmlp=ERR {e!r}")
         _log(f"gemm plan M={M}: " + "; ".join(report))
 
+    def _forward_step_fused(self, st, toks, pos, t, attn):
+        """Fixed split plan with residual add + RMSNorm folded into the GEMVs."""
+        M = toks.shape[0]
+        bufs = self.fused_bufs[M]
+        res_a, res_b = bufs.res[0], bufs.res[1]
+        ss_a, ss_b = bufs.ss[0], bufs.ss[1]
+        cnt = bufs.cnt
+        eps = self.eps
+        x0 = F.embedding(toks, self.embed)
+        h = add_rmsnorm(x0, None, self.layers[0]["ln1"], eps)
+        cur = x0
+        for li, L in enumerate(self.layers):
+            if li == 0:
+                qkv = gemv_fused(h, L["qkv"], SPLIT_QKV, zero_ss=ss_b)
+            else:
+                qkv = gemv_fused(cur, L["qkv"], SPLIT_QKV, norm=(L["ln1"], ss_a), zero_ss=ss_b, eps=eps)
+            a = self._attend(qkv, L, st.k_cache[li], st.v_cache[li], pos, t, attn)
+            gemv_fused(a, L["o"], SPLIT_O, ep=(cur, res_b, ss_b, cnt))            # res_b = cur + o
+            act = gemv_swiglu_fused(res_b, L["gu"], norm=(L["ln2"], ss_b), zero_ss=ss_a, eps=eps)
+            gemv_fused(act, L["down"], SPLIT_DOWN, ep=(res_b, res_a, ss_a, cnt))  # res_a = res_b + delta
+            cur = res_a
+        logits = gemv_fused(cur, self.lm_head, 1, norm=(self.final_norm, ss_a), eps=eps)
+        return torch.argmax(logits, dim=-1)
+
     def _forward_step_gemv(self, st, toks, pos, t, attn, plan_name):
         M = toks.shape[0]
+        if plan_name in ("fused", "fusedpdl"):
+            return self._forward_step_fused(st, toks, pos, t, attn)
         if plan_name in ("fixedpdl", "fixedpdlpf", "fixedpdlpeel"):
             plan_name = "fixed"
         if plan_name == "tunedpdl":
@@ -853,6 +885,8 @@ class Engine:
                 if os.environ.get("ENGINE_PDL_PF") == "1" and pdl.prefetch_ok()                         and not self._late() and self._mega_matches(
                         st, ids, S, steps=8, plan="fixedpdlpf", ref="fixed"):
                     modes += [(1, "fixedpdlpf")]
+            if self.pdl_ok and n >= 4 and not self._late()                     and self._mega_matches(st, ids, S, steps=8, plan="fusedpdl", ref="fixed"):
+                modes += [(1, "fusedpdl")]
             if os.environ.get("ENGINE_TUNED", "1") == "1":
                 modes += [(1, "tuned")]
                 if self.pdl_ok and n >= 4 and not self._late():
@@ -924,7 +958,8 @@ class Engine:
                 self._calibrate(st, ids, input_ids, S, n)
             else:
                 st.mode = (int(os.environ.get("ENGINE_MODE", "1")),
-                           "tuned" if os.environ.get("ENGINE_TEST_GEMV") == "1" else False)
+                           os.environ.get("ENGINE_TEST_PLAN")
+                           or ("tuned" if os.environ.get("ENGINE_TEST_GEMV") == "1" else False))
 
         st.calls = getattr(st, "calls", 0) + 1
         if DIAG and st.calls == 1:
