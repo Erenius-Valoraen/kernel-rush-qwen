@@ -32,7 +32,9 @@ def _prune(configs, named_args, **kwargs):
     ks = named_args.get("K_SPLIT", named_args.get("K"))
     n = named_args.get("N", named_args.get("I"))
     ok = [c for c in configs if ks % c.kwargs["BK"] == 0 and n % c.kwargs["BN"] == 0]
-    return ok or configs[:1]
+    if not ok:
+        raise ValueError(f"no config divides K_SPLIT={ks}, N={n}")
+    return ok
 
 
 @triton.autotune(configs=_CONFIGS, key=["M", "N", "K", "K_SPLIT"],
@@ -146,7 +148,7 @@ else:
         triton.Config({"BN": bn, "BK": bk}, num_warps=w, num_stages=st)
         for bn, bk, w, st in [
             (8, 512, 4, 1), (16, 256, 4, 1), (16, 512, 8, 1), (32, 256, 8, 1),
-            (4, 1024, 4, 1), (8, 512, 4, 3),
+            (4, 1024, 4, 1), (8, 512, 4, 3), (16, 128, 4, 1), (8, 64, 4, 1),
         ]
     ]
 
@@ -219,4 +221,80 @@ def gemv_m1_swiglu(x, w_gu):
     out = torch.empty((1, I), device=x.device, dtype=torch.bfloat16)
     grid = lambda meta: (I // meta["BN"],)
     _gemv_m1_swiglu_kernel[grid](x, w_gu, out, I, K)
+    return out
+
+
+# ---------------------------------------------------------------------------
+# Persistent row-block GEMV: exactly G programs (a multiple of the SM count),
+# program p owns output rows [p*N//G, (p+1)*N//G) over the full K. Every SM
+# gets the same number of bytes, so no SM idles in a tail wave.
+# ---------------------------------------------------------------------------
+
+
+@triton.jit
+def _gemv_rows_kernel(x_ptr, w_ptr, out_ptr, M, N, K, G,
+                      BM: tl.constexpr, BN: tl.constexpr, BK: tl.constexpr,
+                      SWIGLU: tl.constexpr, M1: tl.constexpr, DOT_F32: tl.constexpr):
+    pid = tl.program_id(0)
+    r0 = (pid * N) // G
+    r1 = ((pid + 1) * N) // G
+    offs_m = tl.arange(0, BM)
+    mmask = offs_m < M
+    for n0 in range(r0, r1, BN):
+        offs_n = n0 + tl.arange(0, BN)
+        nmask = offs_n < r1
+        w_rows = w_ptr + offs_n[:, None].to(tl.int64) * K
+        if SWIGLU:
+            u_rows = w_ptr + (N + offs_n[:, None]).to(tl.int64) * K
+        if M1:
+            acc = tl.zeros([BN, BK], tl.float32)
+            acc_u = tl.zeros([BN, BK], tl.float32)
+            for k0 in range(0, K, BK):
+                offs_k = k0 + tl.arange(0, BK)
+                x = tl.load(x_ptr + offs_k).to(tl.float32)[None, :]
+                acc += tl.load(w_rows + offs_k[None, :], mask=nmask[:, None], other=0.0).to(tl.float32) * x
+                if SWIGLU:
+                    acc_u += tl.load(u_rows + offs_k[None, :], mask=nmask[:, None], other=0.0).to(tl.float32) * x
+            res = tl.sum(acc, axis=1)[None, :]
+            res_u = tl.sum(acc_u, axis=1)[None, :]
+        else:
+            res = tl.zeros([BM, BN], tl.float32)
+            res_u = tl.zeros([BM, BN], tl.float32)
+            for k0 in range(0, K, BK):
+                offs_k = k0 + tl.arange(0, BK)
+                x = tl.load(x_ptr + offs_m[:, None] * K + offs_k[None, :], mask=mmask[:, None], other=0.0)
+                w = tl.load(w_rows + offs_k[None, :], mask=nmask[:, None], other=0.0)
+                if DOT_F32:
+                    res += tl.dot(x.to(tl.float32), tl.trans(w.to(tl.float32)))
+                else:
+                    res += tl.dot(x, tl.trans(w))
+                if SWIGLU:
+                    wu = tl.load(u_rows + offs_k[None, :], mask=nmask[:, None], other=0.0)
+                    if DOT_F32:
+                        res_u += tl.dot(x.to(tl.float32), tl.trans(wu.to(tl.float32)))
+                    else:
+                        res_u += tl.dot(x, tl.trans(wu))
+        omask = mmask[:, None] & nmask[None, :]
+        dst = out_ptr + offs_m[:, None].to(tl.int64) * N + offs_n[None, :]
+        if SWIGLU:
+            g = res.to(tl.bfloat16).to(tl.float32)
+            u = res_u.to(tl.bfloat16).to(tl.float32)
+            s = (g / (1.0 + tl.exp(-g))).to(tl.bfloat16).to(tl.float32)
+            tl.store(dst, (s * u).to(tl.bfloat16), mask=omask)
+        else:
+            tl.store(dst, res.to(tl.bfloat16), mask=omask)
+
+
+def gemv_rows(x, w, programs, swiglu=False, bn=16, bk=256, num_warps=4):
+    """Persistent GEMV over `programs` programs; bf16 [M, N] out
+    (N = I and SwiGLU applied if swiglu, with w = [gate; up])."""
+    M, K = x.shape
+    N = w.shape[0] // 2 if swiglu else w.shape[0]
+    out = torch.empty((M, N), device=x.device, dtype=torch.bfloat16)
+    m1 = M == 1
+    _gemv_rows_kernel[(programs,)](
+        x, w, out, M, N, K, programs, BM=max(16, triton.next_power_of_2(M)),
+        BN=bn, BK=bk if m1 else 128, SWIGLU=swiglu, M1=m1, DOT_F32=_DOT_F32,
+        num_warps=num_warps, num_stages=3,
+    )
     return out

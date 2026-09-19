@@ -28,7 +28,7 @@ import torch.nn.functional as F
 from transformers import AutoModelForCausalLM
 
 from kernels.fused_attn import FusedDecodeAttention
-from kernels.gemv import gemv, gemv_m1, gemv_m1_swiglu, gemv_swiglu
+from kernels.gemv import gemv, gemv_m1, gemv_m1_swiglu, gemv_rows, gemv_swiglu
 from kernels.spec import accept as spec_accept, draft as spec_draft
 from kernels.ops import DecodeAttention, add_rmsnorm, qk_norm_rope_cache, silu_mul
 
@@ -51,23 +51,29 @@ def _repeat_kv(x, n_rep):
     return x[:, :, None, :, :].expand(b, h, n_rep, s, d).reshape(b, h * n_rep, s, d)
 
 
+_NUM_SMS = 132
+
+
 def _gemm_candidates(name, M):
     """Implementations of one decode matmul; each returns bf16 [M, N] or fp32
     split-K partials [S, M, N] (lm head and gate/up: bf16 only)."""
+    rows = ["rows1", "rows2"] if M <= 16 else []
     if name == "gu":
-        c = ["cublas", "tr"]
+        c = ["cublas", "tr"] + rows
         return c + ["m1"] if M == 1 else c
     if name == "lm":
-        c = ["cublas", "tr1"]
+        c = ["cublas", "tr1"] + rows
         return c + ["m1_1"] if M == 1 else c
     splits = {"qkv": (1, 2, 4), "o": (1, 2, 4, 8), "down": (1, 2, 4, 8)}[name]
-    c = ["cublas"] + [f"tr{s}" for s in splits]
+    c = ["cublas"] + [f"tr{s}" for s in splits] + rows
     if M == 1:
         c += [f"m1_{s}" for s in splits]
     return c
 
 
 def _gemm_run(name, cand, x, w):
+    if cand.startswith("rows"):
+        return gemv_rows(x, w, _NUM_SMS * int(cand[4:]), swiglu=name == "gu")
     if name == "gu":
         if cand == "cublas":
             return silu_mul(F.linear(x, w))
@@ -207,6 +213,8 @@ class Engine:
         self.eps = cfg.rms_norm_eps
         self.num_sms = (torch.cuda.get_device_properties(self.device).multi_processor_count
                         if self.cuda else 132)
+        global _NUM_SMS
+        _NUM_SMS = self.num_sms if self.cuda else 4
 
         base = model.model
         self.rotary = base.rotary_emb
@@ -321,7 +329,7 @@ class Engine:
                 kc, vc = st.k_cache[li], st.v_cache[li]
                 q = qk_norm_rope_cache(qkv, L["qn"], L["kn"], self.cos, self.sin, kc, vc,
                                        st.zero_pos, S, b0, self.eps, nq, nkv, d)
-                q = q.view(g, S, nq, d).transpose(1, 2).contiguous()
+                q = q.view(g, S, nq, d).transpose(1, 2)
                 k = _repeat_kv(kc[b0:b0 + g, :, :S], nq // nkv).contiguous()
                 v = _repeat_kv(vc[b0:b0 + g, :, :S], nq // nkv).contiguous()
                 a = F.scaled_dot_product_attention(q, k, v, is_causal=True, scale=d ** -0.5)
@@ -385,11 +393,19 @@ class Engine:
                 ws = ws[:1]
             best, best_t = "cublas", None
             times = []
+            ref = _gemm_run(name, "cublas", x, ws[0]).float()
             for cand in _gemm_candidates(name, M):
                 if cand != "cublas" and self._late():
                     continue
                 try:
-                    _gemm_run(name, cand, x, ws[0])          # compile + autotune
+                    got = _gemm_run(name, cand, x, ws[0])    # compile + autotune
+                    if got.dim() == 3:
+                        got = got.sum(0)
+                    err = (got.float() - ref).abs().max().item()
+                    tol = 0.02 * ref.abs().max().item() + 1e-3
+                    if not err <= tol:
+                        times.append(f"{cand}=BAD({err:.3g})")
+                        continue
                     self._sync()
                     t_min = None
                     for _ in range(3 if self.cuda else 1):
