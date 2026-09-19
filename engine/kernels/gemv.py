@@ -20,14 +20,23 @@ if os.environ.get("TRITON_INTERPRET") == "1":
     _CONFIGS = [triton.Config({"BN": 32, "BK": 64}, num_warps=4, num_stages=1)]
 else:
     _CONFIGS = [
-        triton.Config({"BN": 32, "BK": 128}, num_warps=4, num_stages=4),
-        triton.Config({"BN": 64, "BK": 128}, num_warps=4, num_stages=3),
-        triton.Config({"BN": 16, "BK": 128}, num_warps=4, num_stages=4),
-        triton.Config({"BN": 32, "BK": 64}, num_warps=4, num_stages=6),
+        triton.Config({"BN": bn, "BK": bk}, num_warps=w, num_stages=st)
+        for bn, bk, w, st in [
+            (32, 128, 4, 4), (64, 128, 4, 3), (16, 128, 4, 4),
+            (128, 64, 8, 4), (16, 256, 4, 3), (32, 256, 8, 3),
+        ]
     ]
 
 
-@triton.autotune(configs=_CONFIGS, key=["M", "N", "K", "K_SPLIT"])
+def _prune(configs, named_args, **kwargs):
+    ks = named_args.get("K_SPLIT", named_args.get("K"))
+    n = named_args.get("N", named_args.get("I"))
+    ok = [c for c in configs if ks % c.kwargs["BK"] == 0 and n % c.kwargs["BN"] == 0]
+    return ok or configs[:1]
+
+
+@triton.autotune(configs=_CONFIGS, key=["M", "N", "K", "K_SPLIT"],
+                 prune_configs_by={"early_config_prune": _prune})
 @triton.jit
 def _gemv_kernel(x_ptr, w_ptr, out_ptr, M, N, K, K_SPLIT,
                  BM: tl.constexpr, BN: tl.constexpr, BK: tl.constexpr,
@@ -57,7 +66,8 @@ def _gemv_kernel(x_ptr, w_ptr, out_ptr, M, N, K, K_SPLIT,
         tl.store(dst, acc.to(tl.bfloat16), mask=mmask[:, None])
 
 
-@triton.autotune(configs=_CONFIGS, key=["M", "I", "K"])
+@triton.autotune(configs=_CONFIGS, key=["M", "I", "K"],
+                 prune_configs_by={"early_config_prune": _prune})
 @triton.jit
 def _gemv_swiglu_kernel(x_ptr, w_ptr, out_ptr, M, I, K,
                         BM: tl.constexpr, BN: tl.constexpr, BK: tl.constexpr,

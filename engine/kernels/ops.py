@@ -181,6 +181,16 @@ def silu_mul(gu):
 # ---------------------------------------------------------------------------
 
 
+if os.environ.get("TRITON_INTERPRET") == "1":
+    _ATTN_CONFIGS = [triton.Config({"BLOCK_N": 64}, num_warps=4, num_stages=1)]
+else:
+    _ATTN_CONFIGS = [
+        triton.Config({"BLOCK_N": bn}, num_warps=w, num_stages=st)
+        for bn, w, st in [(64, 4, 2), (64, 4, 3), (32, 4, 3), (128, 4, 2), (128, 8, 3), (64, 8, 4)]
+    ]
+
+
+@triton.autotune(configs=_ATTN_CONFIGS, key=["CHUNK", "T", "NSPLIT", "RPAD"])
 @triton.jit
 def _decode_attn_kernel(q_ptr, kc_ptr, vc_ptr, o_ptr, m_ptr, l_ptr, pos_ptr,
                         stride_cb, stride_ch, scale, CHUNK,
@@ -296,8 +306,7 @@ class DecodeAttention:
             q, k_cache, v_cache, self.o, self.m, self.l, pos_t,
             k_cache.stride(0), k_cache.stride(1), self.scale, self.chunk,
             NKV=self.nkv, GROUP=self.group, T=T, RPAD=self.rpad, D=self.d,
-            BLOCK_N=self.BLOCK_N, NSPLIT=self.nsplit, DOT_F32=_DOT_F32,
-            num_warps=4, num_stages=2,
+            NSPLIT=self.nsplit, DOT_F32=_DOT_F32,
         )
         _decode_combine_kernel[(B * T * self.nq,)](
             self.o, self.m, self.l, out,

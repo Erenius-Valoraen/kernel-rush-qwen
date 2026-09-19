@@ -130,10 +130,13 @@ class _Runner:
         s = torch.cuda.Stream()
         s.wait_stream(torch.cuda.current_stream())
         with torch.cuda.stream(s):
+            # Autotuning happens here, so run at the longest context.
             for _ in range(2):
-                self.pos.zero_()
                 if self.t > 1:
                     self.inbuf.zero_()
+                    self.inbuf[:, self.t] = st.capacity - self.t
+                else:
+                    self.pos.fill_(st.capacity - 2)
                 self.step(eng, st)
         torch.cuda.current_stream().wait_stream(s)
         torch.cuda.synchronize()
@@ -485,7 +488,7 @@ class Engine:
             return
         B, S = len(input_ids), len(input_ids[0])
         tmax = max(_spec_candidates(B))
-        self._ensure_rope(S + n + tmax + 1)
+        self._ensure_rope(-(-(S + n + tmax) // 128) * 128 + 1)
         st = self._get_state(B, S + n + tmax)
         ids = torch.tensor(input_ids, dtype=torch.int64, device=self.device)
 
