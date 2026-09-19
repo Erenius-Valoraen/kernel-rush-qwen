@@ -65,6 +65,8 @@ SPEC_MIN_N = int(os.environ.get("ENGINE_SPEC_MIN_N", "64"))   # short outputs: d
 GEMV_MAX_M = 128           # Triton skinny GEMMs up to this many rows
 SPLIT_QKV, SPLIT_O, SPLIT_DOWN = 2, 4, 4
 CALIBRATION_BUDGET_S = 150.0
+FUSED_SPLIT_O = int(os.environ.get("ENGINE_FUSED_SPLIT_O", "1"))
+FUSED_SPLIT_DOWN = int(os.environ.get("ENGINE_FUSED_SPLIT_DOWN", "1"))
 CALIB_REPS = 4                # timed repetitions per decode mode (min taken)
 WARMUP_DEADLINE_S = 180.0     # since __init__ began; the platform allows 300
 FUSED_ATTN = os.environ.get("ENGINE_UNFUSED_ATTN") != "1"
@@ -756,9 +758,9 @@ class Engine:
             else:
                 qkv = gemv_fused(cur, L["qkv"], SPLIT_QKV, norm=(L["ln1"], ss_a), zero_ss=ss_b, eps=eps)
             a = self._attend(qkv, L, st.k_cache[li], st.v_cache[li], pos, t, attn)
-            gemv_fused(a, L["o"], SPLIT_O, ep=(cur, res_b, ss_b, cnt))            # res_b = cur + o
+            gemv_fused(a, L["o"], FUSED_SPLIT_O, ep=(cur, res_b, ss_b, cnt))      # res_b = cur + o
             act = gemv_swiglu_fused(res_b, L["gu"], norm=(L["ln2"], ss_b), zero_ss=ss_a, eps=eps)
-            gemv_fused(act, L["down"], SPLIT_DOWN, ep=(res_b, res_a, ss_a, cnt))  # res_a = res_b + delta
+            gemv_fused(act, L["down"], FUSED_SPLIT_DOWN, ep=(res_b, res_a, ss_a, cnt))  # res_a = res_b + delta
             cur = res_a
         logits = gemv_fused(cur, self.lm_head, 1, norm=(self.final_norm, ss_a), eps=eps)
         return torch.argmax(logits, dim=-1)
@@ -967,7 +969,7 @@ class Engine:
         if not self.cuda and os.environ.get("ENGINE_TEST_GEMV") == "1":
             modes = [(1, "tuned")]
         spec_ts = [t for t in _spec_candidates(B) if t > 1 and n >= SPEC_MIN_N and B == 1
-                   and os.environ.get("ENGINE_SPEC", "1") == "1"]
+                   and os.environ.get("ENGINE_SPEC", "0") == "1"]
         best, best_time, report = (1, False), None, []
         pending = list(modes)
         while pending:
