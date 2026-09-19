@@ -157,7 +157,7 @@ class _Runner:
             self.inp = torch.zeros((B, t), device=dev, dtype=torch.int64)
             self.out = torch.zeros((B, t), device=dev, dtype=torch.int64)
         self.graph = None
-        if use_gemv == "tuned":
+        if use_gemv in ("tuned", "tunedpdl"):
             eng._tune_gemms(B * t)
 
     def step(self, eng, st):
@@ -214,7 +214,7 @@ class _Runner:
                 self.step(eng, st)
         torch.cuda.current_stream().wait_stream(s)
         torch.cuda.synchronize()
-        pdl.set_active(self.use_gemv in ("fixedpdl", "fixedpdlpf"))
+        pdl.set_active(self.use_gemv in ("fixedpdl", "fixedpdlpf", "tunedpdl"))
         try:
             g = torch.cuda.CUDAGraph()
             with torch.cuda.graph(g):
@@ -672,6 +672,8 @@ class Engine:
         M = toks.shape[0]
         if plan_name in ("fixedpdl", "fixedpdlpf"):
             plan_name = "fixed"
+        if plan_name == "tunedpdl":
+            plan_name = "tuned"
         if plan_name == "tuned":
             plan = {k: self.gemm_plan[(k, M)] for k in ("qkv", "o", "gu", "down", "lm", "mlp")}
         else:   # the fixed split plan of v2-v5
@@ -843,11 +845,13 @@ class Engine:
             modes += [(1, "fixed")]
             if self.pdl_ok and n >= 4 and not self._late()                     and self._mega_matches(st, ids, S, steps=8, plan="fixedpdl", ref="fixed"):
                 modes += [(1, "fixedpdl")]
-                if pdl.prefetch_ok() and not self._late() and self._mega_matches(
+                if os.environ.get("ENGINE_PDL_PF") == "1" and pdl.prefetch_ok()                         and not self._late() and self._mega_matches(
                         st, ids, S, steps=8, plan="fixedpdlpf", ref="fixed"):
                     modes += [(1, "fixedpdlpf")]
             if os.environ.get("ENGINE_TUNED", "1") == "1":
                 modes += [(1, "tuned")]
+                if self.pdl_ok and n >= 4 and not self._late():
+                    modes += [(1, "tunedpdl")]
         if not self.cuda and os.environ.get("ENGINE_TEST_GEMV") == "1":
             modes = [(1, "tuned")]
         spec_ts = [t for t in _spec_candidates(B) if t > 1 and n >= 4 and B == 1
