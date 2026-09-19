@@ -193,6 +193,14 @@ class _Runner:
             self.steps_multi(eng, st)
 
     def capture(self, eng, st):
+        pdl.set_prefetch(self.use_gemv == "fixedpdlpf")   # compile variant before capture
+        try:
+            self._capture(eng, st)
+        finally:
+            pdl.set_active(False)
+            pdl.set_prefetch(False)
+
+    def _capture(self, eng, st):
         s = torch.cuda.Stream()
         s.wait_stream(torch.cuda.current_stream())
         with torch.cuda.stream(s):
@@ -206,7 +214,7 @@ class _Runner:
                 self.step(eng, st)
         torch.cuda.current_stream().wait_stream(s)
         torch.cuda.synchronize()
-        pdl.set_active(self.use_gemv == "fixedpdl")
+        pdl.set_active(self.use_gemv in ("fixedpdl", "fixedpdlpf"))
         try:
             g = torch.cuda.CUDAGraph()
             with torch.cuda.graph(g):
@@ -221,6 +229,7 @@ class _Runner:
                 self.graph_multi = gm
         finally:
             pdl.set_active(False)
+            pdl.set_prefetch(False)
 
 
 class _State:
@@ -661,7 +670,7 @@ class Engine:
 
     def _forward_step_gemv(self, st, toks, pos, t, attn, plan_name):
         M = toks.shape[0]
-        if plan_name == "fixedpdl":
+        if plan_name in ("fixedpdl", "fixedpdlpf"):
             plan_name = "fixed"
         if plan_name == "tuned":
             plan = {k: self.gemm_plan[(k, M)] for k in ("qkv", "o", "gu", "down", "lm", "mlp")}
@@ -834,6 +843,9 @@ class Engine:
             modes += [(1, "fixed")]
             if self.pdl_ok and n >= 4 and not self._late()                     and self._mega_matches(st, ids, S, steps=8, plan="fixedpdl", ref="fixed"):
                 modes += [(1, "fixedpdl")]
+                if pdl.prefetch_ok() and not self._late() and self._mega_matches(
+                        st, ids, S, steps=8, plan="fixedpdlpf", ref="fixed"):
+                    modes += [(1, "fixedpdlpf")]
             if os.environ.get("ENGINE_TUNED", "1") == "1":
                 modes += [(1, "tuned")]
         if not self.cuda and os.environ.get("ENGINE_TEST_GEMV") == "1":

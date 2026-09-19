@@ -15,7 +15,7 @@ import triton
 import triton.language as tl
 
 from kernels import pdl
-from kernels.pdl import pdl_launch, pdl_wait
+from kernels.pdl import pdl_launch, pdl_wait, prefetch_l2
 
 _DOT_F32 = os.environ.get("TRITON_INTERPRET") == "1"
 
@@ -46,11 +46,16 @@ def _prune(configs, named_args, **kwargs):
 @triton.jit
 def _gemv_kernel(x_ptr, w_ptr, out_ptr, M, N, K, K_SPLIT,
                  BM: tl.constexpr, BN: tl.constexpr, BK: tl.constexpr,
-                 PARTIAL: tl.constexpr, DOT_F32: tl.constexpr, PDL: tl.constexpr = False):
-    z = pdl_wait(PDL)
-    pdl_launch(PDL)
+                 PARTIAL: tl.constexpr, DOT_F32: tl.constexpr, PDL: tl.constexpr = False,
+                 PREFETCH: tl.constexpr = False):
     pid_n = tl.program_id(0)
     pid_k = tl.program_id(1)
+    # weights are read-only: stream this program's slab into L2 while the
+    # predecessor kernel is still finishing
+    prefetch_l2(w_ptr + (pid_n * BN + tl.arange(0, BN)).to(tl.int64) * K + pid_k * K_SPLIT,
+                K_SPLIT * 2, PREFETCH)
+    z = pdl_wait(PDL)
+    pdl_launch(PDL)
     offs_m = tl.arange(0, BM) + z
     offs_n = pid_n * BN + tl.arange(0, BN)
     mmask = offs_m < M
@@ -80,10 +85,14 @@ def _gemv_kernel(x_ptr, w_ptr, out_ptr, M, N, K, K_SPLIT,
 @triton.jit
 def _gemv_swiglu_kernel(x_ptr, w_ptr, out_ptr, M, I, K,
                         BM: tl.constexpr, BN: tl.constexpr, BK: tl.constexpr,
-                        DOT_F32: tl.constexpr, PDL: tl.constexpr = False):
+                        DOT_F32: tl.constexpr, PDL: tl.constexpr = False,
+                        PREFETCH: tl.constexpr = False):
+    pid_n = tl.program_id(0)
+    rows = (pid_n * BN + tl.arange(0, BN)).to(tl.int64)
+    prefetch_l2(w_ptr + rows * K, K * 2, PREFETCH)
+    prefetch_l2(w_ptr + (I + rows) * K, K * 2, PREFETCH)
     z = pdl_wait(PDL)
     pdl_launch(PDL)
-    pid_n = tl.program_id(0)
     offs_m = tl.arange(0, BM) + z
     offs_n = pid_n * BN + tl.arange(0, BN)
     mmask = offs_m < M
@@ -130,7 +139,8 @@ def gemv(x, w, split=1):
     grid = lambda meta: (N // meta["BN"], split)
     pdl.before_launch()
     _gemv_kernel[grid](x, w, out, M, N, K, k_split, BM=_bm(M),
-                       PARTIAL=split > 1, DOT_F32=_DOT_F32, PDL=pdl.compiled())
+                       PARTIAL=split > 1, DOT_F32=_DOT_F32, PDL=pdl.compiled(),
+                       PREFETCH=pdl.prefetch_on())
     pdl.after_launch()
     return out
 
@@ -143,7 +153,7 @@ def gemv_swiglu(x, w_gu):
     grid = lambda meta: (I // meta["BN"],)
     pdl.before_launch()
     _gemv_swiglu_kernel[grid](x, w_gu, out, M, I, K, BM=_bm(M), DOT_F32=_DOT_F32,
-                              PDL=pdl.compiled())
+                              PDL=pdl.compiled(), PREFETCH=pdl.prefetch_on())
     pdl.after_launch()
     return out
 

@@ -137,6 +137,36 @@ def compiled():
     return _lib is not None
 
 
+_PREFETCH = None
+_PREFETCH_ON = False
+
+
+def set_prefetch(flag):
+    global _PREFETCH_ON
+    _PREFETCH_ON = bool(flag) and prefetch_ok()
+
+
+def prefetch_on():
+    return _PREFETCH_ON
+
+
+def prefetch_ok():
+    """Whether the L2 bulk-prefetch PTX compiles and runs (checked once)."""
+    global _PREFETCH
+    if _PREFETCH is None:
+        _PREFETCH = False
+        if _lib is not None and os.environ.get("ENGINE_NO_PREFETCH") != "1":
+            try:
+                x = torch.arange(1024, device="cuda", dtype=torch.int32)
+                y = torch.zeros(64, device="cuda", dtype=torch.int32)
+                _prefetch_selftest[(1,)](x, y)
+                torch.cuda.synchronize()
+                _PREFETCH = bool(torch.equal(y, x[:64]))
+            except Exception:
+                _PREFETCH = False
+    return _PREFETCH
+
+
 @triton.jit
 def pdl_wait(PDL: tl.constexpr):
     """Block until the programmatic predecessor finished (no-op otherwise).
@@ -149,6 +179,18 @@ def pdl_wait(PDL: tl.constexpr):
         return tl.sum(z, axis=0)
     else:
         return 0
+
+
+@triton.jit
+def prefetch_l2(ptrs, nbytes, PREFETCH: tl.constexpr):
+    """Hopper bulk prefetch of `nbytes` starting at each pointer into L2
+    (fire-and-forget; read-only data only)."""
+    if PREFETCH:
+        addr = ptrs.to(tl.int64)
+        n = tl.full(addr.shape, 0, tl.int32) + nbytes
+        tl.inline_asm_elementwise(
+            "cp.async.bulk.prefetch.L2.global [$1], $2; mov.u32 $0, 0;", "=r,l,r",
+            [addr, n], dtype=tl.int32, is_pure=False, pack=1)
 
 
 @triton.jit
@@ -166,3 +208,11 @@ def _selftest_kernel(x_ptr, PDL: tl.constexpr):
     pdl_launch(PDL)
     offs = tl.arange(0, 64) + z
     tl.store(x_ptr + offs, tl.load(x_ptr + offs) + 1)
+
+
+@triton.jit
+def _prefetch_selftest(x_ptr, y_ptr):
+    rows = tl.arange(0, 4)
+    prefetch_l2(x_ptr + rows * 256, 1024, True)
+    offs = tl.arange(0, 64)
+    tl.store(y_ptr + offs, tl.load(x_ptr + offs))
