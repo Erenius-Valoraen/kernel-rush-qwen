@@ -1008,9 +1008,33 @@ class Engine:
                 # speculative modes reuse the best plain matmul plan
                 pending = [(ts, best[1]) for ts in spec_ts]
                 spec_ts = []
+        # Batch 1: a T=4 verify step costs ~1% more than a plain step on H100 and
+        # yields >= 1 token, so speculation is always on (no warmup-prompt luck).
+        if (B == 1 and n >= 8 and self.cuda and best[0] == 1 and best[1] is not False
+                and os.environ.get("ENGINE_SPEC_ALWAYS", "1") == "1"):
+            try:
+                st.runner(self, 4, best[1])
+                for _ in self._spec(st, ids, input_ids, S, n, 4, best[1]):
+                    pass
+                best = (4, best[1])
+            except Exception as e:  # pragma: no cover
+                _log(f"always-on spec unavailable: {e!r}")
         force = os.environ.get("ENGINE_FORCE_PLAN")
         if force and (1, force) in modes:
             best = (1, force)
+        if os.environ.get("ENGINE_TRACE") == "1" and self.cuda:
+            for key, r in st.runners.items():
+                for nm, g in (("single", r.graph), ("multi", getattr(r, "graph_multi", None))):
+                    if g is None:
+                        continue
+                    self._sync()
+                    t0 = time.perf_counter()
+                    for _ in range(10):
+                        g.replay()
+                    host = (time.perf_counter() - t0) / 10
+                    self._sync()
+                    dev = (time.perf_counter() - t0) / 10
+                    _log(f"replay cost {key} {nm}: host {host * 1e3:.2f}ms  device {dev * 1e3:.2f}ms")
         st.mode = best
         _log(f"B={B} S={S} n={n} calibration ({time.perf_counter() - start:.1f}s): "
              f"{'; '.join(report)} -> {best}")

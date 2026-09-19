@@ -18,7 +18,7 @@ image = (
     .pip_install("torch==2.5.1", "triton==3.1.0", extra_index_url="https://download.pytorch.org/whl/cu124")
     .pip_install("transformers==4.51.3", "safetensors==0.5.3", "tokenizers==0.21.1",
                  "huggingface_hub", "numpy", "accelerate")
-    .add_local_dir(os.path.join(HERE, "engine"), "/root/engine", ignore=["__pycache__"])
+    .add_local_dir(os.environ.get("ENGINE_DIR") or os.path.join(HERE, "engine"), "/root/engine", ignore=["__pycache__"])
 )
 vol = modal.Volume.from_name("qwen3-4b-weights", create_if_missing=True)
 app = modal.App("kernel-rush-bench", image=image)
