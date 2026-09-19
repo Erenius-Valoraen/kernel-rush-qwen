@@ -150,6 +150,19 @@ def prefetch_on():
     return _PREFETCH_ON
 
 
+_PEEL_ON = False
+
+
+def set_peel(flag):
+    """Kernels load their first weight tile before the PDL wait."""
+    global _PEEL_ON
+    _PEEL_ON = bool(flag) and _lib is not None
+
+
+def peel_on():
+    return _PEEL_ON
+
+
 def prefetch_ok():
     """Whether the L2 bulk-prefetch PTX compiles and runs (checked once)."""
     global _PREFETCH

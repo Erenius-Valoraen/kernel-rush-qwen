@@ -194,11 +194,13 @@ class _Runner:
 
     def capture(self, eng, st):
         pdl.set_prefetch(self.use_gemv == "fixedpdlpf")   # compile variant before capture
+        pdl.set_peel(self.use_gemv == "fixedpdlpeel")
         try:
             self._capture(eng, st)
         finally:
             pdl.set_active(False)
             pdl.set_prefetch(False)
+            pdl.set_peel(False)
 
     def _capture(self, eng, st):
         s = torch.cuda.Stream()
@@ -214,7 +216,7 @@ class _Runner:
                 self.step(eng, st)
         torch.cuda.current_stream().wait_stream(s)
         torch.cuda.synchronize()
-        pdl.set_active(self.use_gemv in ("fixedpdl", "fixedpdlpf", "tunedpdl"))
+        pdl.set_active(self.use_gemv in ("fixedpdl", "fixedpdlpf", "tunedpdl", "fixedpdlpeel"))
         try:
             g = torch.cuda.CUDAGraph()
             with torch.cuda.graph(g):
@@ -670,7 +672,7 @@ class Engine:
 
     def _forward_step_gemv(self, st, toks, pos, t, attn, plan_name):
         M = toks.shape[0]
-        if plan_name in ("fixedpdl", "fixedpdlpf"):
+        if plan_name in ("fixedpdl", "fixedpdlpf", "fixedpdlpeel"):
             plan_name = "fixed"
         if plan_name == "tunedpdl":
             plan_name = "tuned"
@@ -845,6 +847,9 @@ class Engine:
             modes += [(1, "fixed")]
             if self.pdl_ok and n >= 4 and not self._late()                     and self._mega_matches(st, ids, S, steps=8, plan="fixedpdl", ref="fixed"):
                 modes += [(1, "fixedpdl")]
+                if not self._late() and self._mega_matches(
+                        st, ids, S, steps=8, plan="fixedpdlpeel", ref="fixed"):
+                    modes += [(1, "fixedpdlpeel")]
                 if os.environ.get("ENGINE_PDL_PF") == "1" and pdl.prefetch_ok()                         and not self._late() and self._mega_matches(
                         st, ids, S, steps=8, plan="fixedpdlpf", ref="fixed"):
                     modes += [(1, "fixedpdlpf")]

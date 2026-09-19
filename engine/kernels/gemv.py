@@ -47,23 +47,32 @@ def _prune(configs, named_args, **kwargs):
 def _gemv_kernel(x_ptr, w_ptr, out_ptr, M, N, K, K_SPLIT,
                  BM: tl.constexpr, BN: tl.constexpr, BK: tl.constexpr,
                  PARTIAL: tl.constexpr, DOT_F32: tl.constexpr, PDL: tl.constexpr = False,
-                 PREFETCH: tl.constexpr = False):
+                 PREFETCH: tl.constexpr = False, PEEL: tl.constexpr = False):
     pid_n = tl.program_id(0)
     pid_k = tl.program_id(1)
-    # weights are read-only: stream this program's slab into L2 while the
-    # predecessor kernel is still finishing
-    prefetch_l2(w_ptr + (pid_n * BN + tl.arange(0, BN)).to(tl.int64) * K + pid_k * K_SPLIT,
-                K_SPLIT * 2, PREFETCH)
+    offs_n = pid_n * BN + tl.arange(0, BN)
+    k0 = pid_k * K_SPLIT
+    w_base = w_ptr + offs_n[:, None].to(tl.int64) * K
+    # weights are read-only: start fetching them while the predecessor kernel
+    # is still finishing (before the PDL wait)
+    prefetch_l2(w_ptr + offs_n.to(tl.int64) * K + k0, K_SPLIT * 2, PREFETCH)
+    if PEEL:
+        w_first = tl.load(w_base + (k0 + tl.arange(0, BK))[None, :])
     z = pdl_wait(PDL)
     pdl_launch(PDL)
     offs_m = tl.arange(0, BM) + z
-    offs_n = pid_n * BN + tl.arange(0, BN)
     mmask = offs_m < M
     acc = tl.zeros([BM, BN], tl.float32)
-    k0 = pid_k * K_SPLIT
     x_base = x_ptr + offs_m[:, None] * K
-    w_base = w_ptr + offs_n[:, None].to(tl.int64) * K
-    for kk in range(0, K_SPLIT, BK):
+    kk_start = 0
+    if PEEL:
+        x = tl.load(x_base + (k0 + tl.arange(0, BK))[None, :], mask=mmask[:, None], other=0.0)
+        if DOT_F32:
+            acc += tl.dot(x.to(tl.float32), tl.trans(w_first.to(tl.float32)))
+        else:
+            acc += tl.dot(x, tl.trans(w_first))
+        kk_start = BK
+    for kk in range(kk_start, K_SPLIT, BK):
         offs_k = k0 + kk + tl.arange(0, BK)
         x = tl.load(x_base + offs_k[None, :], mask=mmask[:, None], other=0.0)
         w = tl.load(w_base + offs_k[None, :])
@@ -140,7 +149,7 @@ def gemv(x, w, split=1):
     pdl.before_launch()
     _gemv_kernel[grid](x, w, out, M, N, K, k_split, BM=_bm(M),
                        PARTIAL=split > 1, DOT_F32=_DOT_F32, PDL=pdl.compiled(),
-                       PREFETCH=pdl.prefetch_on())
+                       PREFETCH=pdl.prefetch_on(), PEEL=pdl.peel_on())
     pdl.after_launch()
     return out
 
