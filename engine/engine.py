@@ -60,7 +60,7 @@ from kernels.ops import (DecodeAttention, add_rmsnorm, qk_norm_rope_cache,
 PREFILL_TOKENS = 8192      # rows per prefill chunk (whole sequences per chunk)
 LOOKAHEAD = 8              # plain mode: steps enqueued ahead of the one yielded
 MULTI = int(os.environ.get("ENGINE_MULTI", "4"))   # decode steps per graph launch
-SPEC_MARGIN = 0.93         # speculative must beat plain by 7% on warmup
+SPEC_MARGIN = 0.90         # speculative must beat plain by 10% on warmup
 SPEC_MIN_N = int(os.environ.get("ENGINE_SPEC_MIN_N", "64"))   # short outputs: drafts rarely hit
 GEMV_MAX_M = 128           # Triton skinny GEMMs up to this many rows
 SPLIT_QKV, SPLIT_O, SPLIT_DOWN = 2, 4, 4
@@ -128,11 +128,11 @@ def _spec_candidates(batch):
     if env is not None:
         return [int(t) for t in env.split(",")]
     if batch == 1:
-        return [1, 4, 8]
+        return [1, 4, 8, 16]
     if batch <= 4:
-        return [1, 4, 6]
+        return [1, 4, 8]
     if batch <= 16:
-        return [1, 3, 5]
+        return [1, 4, 8]
     if batch <= 32:
         return [1, 2]
     return [1]
@@ -968,7 +968,7 @@ class Engine:
                     modes += [(1, "tunedpdl")]
         if not self.cuda and os.environ.get("ENGINE_TEST_GEMV") == "1":
             modes = [(1, "tuned")]
-        spec_ts = [t for t in _spec_candidates(B) if t > 1 and n >= SPEC_MIN_N and B == 1
+        spec_ts = [t for t in _spec_candidates(B) if t > 1 and n >= 16 and B <= 16
                    and os.environ.get("ENGINE_SPEC", "0") == "1"]
         best, best_time, report = (1, False), None, []
         pending = list(modes)
@@ -1013,10 +1013,11 @@ class Engine:
         if (B == 1 and n >= 8 and self.cuda and best[0] == 1 and best[1] is not False
                 and os.environ.get("ENGINE_SPEC_ALWAYS", "1") == "1"):
             try:
-                st.runner(self, 4, best[1])
-                for _ in self._spec(st, ids, input_ids, S, n, 4, best[1]):
+                t_spec = 8 if n >= 192 else 4      # longer outputs repeat more: deeper drafts pay
+                st.runner(self, t_spec, best[1])
+                for _ in self._spec(st, ids, input_ids, S, n, t_spec, best[1]):
                     pass
-                best = (4, best[1])
+                best = (t_spec, best[1])
             except Exception as e:  # pragma: no cover
                 _log(f"always-on spec unavailable: {e!r}")
         force = os.environ.get("ENGINE_FORCE_PLAN")

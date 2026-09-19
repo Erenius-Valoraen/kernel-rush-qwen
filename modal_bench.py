@@ -50,6 +50,13 @@ def bench(shapes: str, check: int, env: str, samples: int):
         for f in sorted(glob.glob("/usr/share/common-licenses/*")):
             text += open(f, errors="ignore").read()
     text = text[:3_000_000]
+    if os.environ.get("BENCH_CORPUS") == "qa":
+        NL = chr(10)
+        qs = ["What is the capital of France?", "Name a primary color.", "What is 2 + 2?", "Is water wet?",
+              "What day comes after Monday?", "Spell the word cat.", "What is the opposite of hot?"]
+        text = "".join("<|im_start|>user" + NL + q + "<|im_end|>" + NL + "<|im_start|>assistant" + NL
+                       + ("Yes." if i % 2 else "It is simple.") + "<|im_end|>" + NL
+                       for i, q in enumerate(qs * 3000))
     corpus = tok(text, add_special_tokens=False)["input_ids"]
     print(f"corpus tokens: {len(corpus)}  gpu: {torch.cuda.get_device_name(0)}")
 

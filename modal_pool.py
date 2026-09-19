@@ -40,58 +40,59 @@ def run(S: int, N: int):
     for o in outs[:4]:
         print("   ", repr(tok.decode(o[:48])))
 
-    def simulate(prompt, out, pool, K=4, NG=4):
-        """tokens emitted per verify step with longest-suffix n-gram drafting (K drafts)."""
-        hist = list(prompt); steps = 0; i = 0
-        index = {}
-        def add(seq, upto_from=0):
-            pass
-        while i < len(out):
-            # draft
-            ctx = hist
-            draft = []
-            for n in range(NG, 0, -1):
-                key = tuple(ctx[-n:])
-                pos = None
-                # own history (latest occurrence before end)
-                for j in range(len(ctx) - n - 1, -1, -1):
-                    if tuple(ctx[j:j + n]) == key:
-                        pos = ("own", j + n); break
-                if pos is None and pool is not None:
-                    p = pool.get(key)
-                    if p is not None:
-                        pos = ("pool", p)
-                if pos is not None:
-                    if pos[0] == "own":
-                        draft = ctx[pos[1]:pos[1] + K]
-                    else:
-                        draft = list(pos[1][:K])
-                    break
-            a = 0
-            while a < len(draft) and i + a < len(out) and draft[a] == out[i + a]:
-                a += 1
-            take = min(a + 1, len(out) - i)
-            hist += out[i:i + take]; i += take; steps += 1
-        return len(out) / steps
+    def candidates(ctx, pool, C, D, NG=4):
+        """Up to C chains (distinct first token) of depth D: latest matches of the longest suffixes."""
+        cands, seen = [], set()
+        for n in range(NG, 0, -1):
+            key = tuple(ctx[-n:])
+            j = len(ctx) - n - 1
+            while j >= 0 and len(cands) < C:
+                if tuple(ctx[j:j + n]) == key:
+                    ch = ctx[j + n:j + n + D]
+                    if ch and ch[0] not in seen:
+                        seen.add(ch[0]); cands.append(ch)
+                j -= 1
+            if pool is not None and len(cands) < C:
+                for ch in pool.get(key, ()):
+                    if ch[0] not in seen and len(cands) < C:
+                        seen.add(ch[0]); cands.append(list(ch[:D]))
+            if len(cands) >= C:
+                break
+        return cands
 
-    def build_pool(seqs, NG=4, K=8):
+    def simulate(prompt, out, pool, C, D):
+        hist = list(prompt); i = 0; steps = 0
+        while i < len(out):
+            best = 0
+            for ch in candidates(hist, pool, C, D):
+                a = 0
+                while a < len(ch) and i + a < len(out) and ch[a] == out[i + a]:
+                    a += 1
+                best = max(best, a)
+            take = min(best + 1, len(out) - i)
+            hist += out[i:i + take]; i += take; steps += 1
+        return steps
+
+    def build_pool(seqs, NG=4, K=8, W=4):
         pool = {}
-        for s in seqs:
+        for s_ in seqs:
             for n in range(1, NG + 1):
-                for j in range(len(s) - n):
-                    pool.setdefault(tuple(s[j:j + n]), tuple(s[j + n:j + n + K]))
+                for j in range(len(s_) - n):
+                    lst = pool.setdefault(tuple(s_[j:j + n]), [])
+                    ch = tuple(s_[j + n:j + n + K])
+                    if ch and len(lst) < W and all(c[0] != ch[0] for c in lst):
+                        lst.append(ch)
         return pool
 
     import statistics
-    own = [simulate(p, o, None) for p, o in zip(prompts[-16:], outs[-16:])]
+    test_p, test_o = prompts[-16:], outs[-16:]
     pool = build_pool(outs[:-16])
-    shared = [simulate(p, o, pool) for p, o in zip(prompts[-16:], outs[-16:])]
-    print(f"S={S} N={N}: tokens/step own-history mean {statistics.mean(own):.3f} min {min(own):.2f} | "
-          f"+pool of {len(outs) - 16} earlier outputs mean {statistics.mean(shared):.3f} min {min(shared):.2f}")
-    for n_first in (16, 32, 64):
-        o2 = [simulate(p, o[:n_first], None) for p, o in zip(prompts[-16:], outs[-16:])]
-        s2 = [simulate(p, o[:n_first], pool) for p, o in zip(prompts[-16:], outs[-16:])]
-        print(f"   first {n_first} tokens: own {statistics.mean(o2):.3f}  +pool {statistics.mean(s2):.3f} (min {min(s2):.2f})")
+    for nn in (32, 128):
+        print(f"--- first {nn} output tokens, S={S}; tokens/step: mean over seqs | batch-of-16 lockstep (slowest seq)")
+        for C, D in ((1, 3), (1, 7), (2, 3), (3, 2), (4, 3), (7, 1), (8, 3), (16, 3)):
+            for nm, pl in (("own", None), ("own+pool", pool)):
+                st_ = [simulate(p, o[:nn], pl, C, D) for p, o in zip(test_p, test_o)]
+                print(f"   C={C:2d} D={D} slots={C * D:2d} {nm:9s}: mean {nn / statistics.mean(st_):.3f} | lockstep {nn / max(st_):.3f}")
 
 
 @app.local_entrypoint()

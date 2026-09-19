@@ -45,7 +45,10 @@ def _draft_kernel(hist_ptr, hlen_ptr, inp_ptr, pos_ptr, HCAP,
     top = tl.max(best, axis=0)
     start = (top % 16777216) + 1
     k = tl.arange(0, TPAD)
-    src = start + k - 1
+    # continuation of the match; when it runs off the end of the history the
+    # text is repeating with period (L - start): wrap around cyclically
+    period = tl.maximum(L - start, 1)
+    src = start + (k - 1) % period
     dmask = (k >= 1) & (k < T) & (top >= 0) & (src < L)
     d = tl.load(base + src, mask=dmask, other=0)
     d = tl.where(dmask, d, t0)
