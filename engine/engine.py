@@ -77,6 +77,7 @@ LAST_LAYER_TRIM = os.environ.get("ENGINE_NO_TRIM") != "1"
 # prefill GEMMs run in FP8 (organisers allow FP8 compute); decode stays bf16
 FP8_SITES = tuple(filter(None, re.split("[,:]", os.environ.get("ENGINE_FP8", "gu"))))
 FP8_SKIP = tuple(int(v) for v in re.split("[,:]", os.environ.get("ENGINE_FP8_SKIP", "0:0")))   # leading, trailing bf16 layers
+FP8_DECODE = os.environ.get("ENGINE_FP8_DECODE", "1") == "1"   # gate/up + down in FP8 at decode, M >= 4
 FP8_MIN_ROWS = int(os.environ.get("ENGINE_FP8_MIN_ROWS", "256"))
 DIAG = os.environ.get("ENGINE_DIAG", "0") == "1"      # telemetry-through-timing build
 
@@ -351,7 +352,7 @@ class Engine:
             try:
                 with torch.no_grad():
                     for L in self.layers:
-                        for key in FP8_SITES:
+                        for key in set(FP8_SITES) | ({"gu", "down"} if FP8_DECODE else set()):
                             L[key + "8"] = quantize_weight(L[key])
                 fp8.pick_cast(_log)
                 self.fp8_ok = True
@@ -492,10 +493,12 @@ class Engine:
                     a = self._prefill_attn2(q, kc, vc, S, b0, g)
                     o = self._pf_linear(a, li, "o") if self._pf_fp8(a, "o", li) else F.linear(a, L["o"])
                     h = add_rmsnorm(x, o, L["ln2"], self.eps)
+                    self._fp8_record(li, "gu", h)
                     if self._pf_fp8(h, "gu", li):
                         act = silu_mul(self._pf_linear(h, li, "gu"))
                     else:
                         act = self._prefill_gu(h, L["gu"])
+                    self._fp8_record(li, "down", act)
                     delta = self._pf_linear(act, li, "down") if self._pf_fp8(act, "down", li) else F.linear(act, L["down"])
             if not LAST_LAYER_TRIM:
                 xl = x.view(g, S, -1)[:, -1].contiguous()
@@ -503,6 +506,12 @@ class Engine:
             h = add_rmsnorm(xl, dl, self.final_norm, self.eps)
             logits = F.linear(h, self.lm_head)
             st.first[b0:b0 + g] = torch.argmax(logits, dim=-1)
+
+    def _fp8_record(self, li, key, x):
+        """First eager prefill: keep this site's activation scale for the FP8 decode plan."""
+        if (self.fp8_ok and FP8_DECODE and (li, key) not in self.fp8_act
+                and not torch.cuda.is_current_stream_capturing()):
+            self.fp8_act[(li, key)] = ActScale(x)
 
     def _pf_fp8(self, x, key, li):
         return (self.fp8_ok and key in FP8_SITES and x.shape[0] >= FP8_MIN_ROWS
@@ -803,8 +812,31 @@ class Engine:
         logits = gemv_fused(cur, self.lm_head, 1, norm=(self.final_norm, ss_a), eps=eps)
         return torch.argmax(logits, dim=-1)
 
+    def _forward_step_fp8(self, st, toks, pos, t, attn):
+        """Fixed split plan with the MLP matmuls in FP8 (cuBLASLt). The last
+        layer (no prefill scales: it is trimmed there) stays bf16."""
+        x = F.embedding(toks, self.embed)
+        h = add_rmsnorm(x, None, self.layers[0]["ln1"], self.eps)
+        n = len(self.layers)
+        for li, L in enumerate(self.layers):
+            qkv = gemv(h, L["qkv"], SPLIT_QKV)
+            a = self._attend(qkv, L, st.k_cache[li], st.v_cache[li], pos, t, attn)
+            h = add_rmsnorm(x, gemv(a, L["o"], SPLIT_O), L["ln2"], self.eps)
+            ag, ad = self.fp8_act.get((li, "gu")), self.fp8_act.get((li, "down"))
+            if ag is not None and ad is not None:
+                act = silu_mul(linear_fp8(h, L["gu8"], ag))
+                delta = linear_fp8(act, L["down8"], ad)
+            else:
+                delta = gemv(gemv_swiglu(h, L["gu"]), L["down"], SPLIT_DOWN)
+            nw = self.layers[li + 1]["ln1"] if li + 1 < n else self.final_norm
+            h = add_rmsnorm(x, delta, nw, self.eps)
+        logits = gemv(h, self.lm_head, 1)
+        return torch.argmax(logits, dim=-1)
+
     def _forward_step_gemv(self, st, toks, pos, t, attn, plan_name):
         M = toks.shape[0]
+        if plan_name == "fp8":
+            return self._forward_step_fp8(st, toks, pos, t, attn)
         if plan_name in ("fused", "fusedpdl"):
             return self._forward_step_fused(st, toks, pos, t, attn)
         if plan_name in ("fixedpdl", "fixedpdlpf", "fixedpdlpeel"):
@@ -982,6 +1014,8 @@ class Engine:
         B = st.batch
         start = time.perf_counter()
         gemv_ok = self.cuda and os.environ.get("ENGINE_NO_GEMV") != "1"
+        if self.fp8_ok and FP8_DECODE and (0, "down") not in self.fp8_act:
+            self._prefill(ids, st)          # measures the activation scales
         modes = [(1, False)]
         if self.mega_ok and B <= 16 and n >= 4:
             for plan in filter(None, os.environ.get("ENGINE_MEGA_PLANS", "").split(",")):
@@ -989,6 +1023,8 @@ class Engine:
                     modes.append((1, plan))
         if gemv_ok and B <= GEMV_MAX_M:
             modes += [(1, "fixed")]
+            if self.fp8_ok and FP8_DECODE and B >= 4 and (0, "down") in self.fp8_act:
+                modes += [(1, "fp8")]
             if self.pdl_ok and n >= 4 and not self._late()                     and self._mega_matches(st, ids, S, steps=8, plan="fixedpdl", ref="fixed"):
                 modes += [(1, "fixedpdl")]
                 if os.environ.get("ENGINE_PDL_PEEL") == "1" and not self._late()                         and self._mega_matches(st, ids, S, steps=8, plan="fixedpdlpeel", ref="fixed"):
