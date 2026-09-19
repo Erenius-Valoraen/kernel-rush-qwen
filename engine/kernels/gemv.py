@@ -189,7 +189,11 @@ else:
                  warmup=5, rep=20)
 @triton.jit
 def _gemv_m1_kernel(x_ptr, w_ptr, out_ptr, N, K, K_SPLIT,
-                    BN: tl.constexpr, BK: tl.constexpr, PARTIAL: tl.constexpr):
+                    BN: tl.constexpr, BK: tl.constexpr, PARTIAL: tl.constexpr,
+                    PDL: tl.constexpr = False):
+    z = pdl_wait(PDL)
+    pdl_launch(PDL)
+    x_ptr += z
     pid_n = tl.program_id(0)
     pid_k = tl.program_id(1)
     offs_n = pid_n * BN + tl.arange(0, BN)
@@ -213,7 +217,10 @@ def _gemv_m1_kernel(x_ptr, w_ptr, out_ptr, N, K, K_SPLIT,
                  warmup=5, rep=20)
 @triton.jit
 def _gemv_m1_swiglu_kernel(x_ptr, w_ptr, out_ptr, I, K,
-                           BN: tl.constexpr, BK: tl.constexpr):
+                           BN: tl.constexpr, BK: tl.constexpr, PDL: tl.constexpr = False):
+    z = pdl_wait(PDL)
+    pdl_launch(PDL)
+    x_ptr += z
     pid_n = tl.program_id(0)
     offs_n = pid_n * BN + tl.arange(0, BN)
     acc_g = tl.zeros([BN, BK], tl.float32)
@@ -241,7 +248,9 @@ def gemv_m1(x, w, split=1):
     else:
         out = torch.empty((split, 1, N), device=x.device, dtype=torch.float32)
     grid = lambda meta: (N // meta["BN"], split)
-    _gemv_m1_kernel[grid](x, w, out, N, K, K // split, PARTIAL=split > 1)
+    pdl.before_launch()
+    _gemv_m1_kernel[grid](x, w, out, N, K, K // split, PARTIAL=split > 1, PDL=pdl.compiled())
+    pdl.after_launch()
     return out
 
 
@@ -251,7 +260,9 @@ def gemv_m1_swiglu(x, w_gu):
     I = w_gu.shape[0] // 2
     out = torch.empty((1, I), device=x.device, dtype=torch.bfloat16)
     grid = lambda meta: (I // meta["BN"],)
-    _gemv_m1_swiglu_kernel[grid](x, w_gu, out, I, K)
+    pdl.before_launch()
+    _gemv_m1_swiglu_kernel[grid](x, w_gu, out, I, K, PDL=pdl.compiled())
+    pdl.after_launch()
     return out
 
 
@@ -265,7 +276,11 @@ def gemv_m1_swiglu(x, w_gu):
 @triton.jit
 def _gemv_rows_kernel(x_ptr, w_ptr, out_ptr, M, N, K, G,
                       BM: tl.constexpr, BN: tl.constexpr, BK: tl.constexpr,
-                      SWIGLU: tl.constexpr, M1: tl.constexpr, DOT_F32: tl.constexpr):
+                      SWIGLU: tl.constexpr, M1: tl.constexpr, DOT_F32: tl.constexpr,
+                      PDL: tl.constexpr = False):
+    z = pdl_wait(PDL)
+    pdl_launch(PDL)
+    x_ptr += z
     pid = tl.program_id(0)
     r0 = (pid * N) // G
     r1 = ((pid + 1) * N) // G
@@ -323,11 +338,13 @@ def gemv_rows(x, w, programs, swiglu=False, bn=16, bk=256, num_warps=4):
     N = w.shape[0] // 2 if swiglu else w.shape[0]
     out = torch.empty((M, N), device=x.device, dtype=torch.bfloat16)
     m1 = M == 1
+    pdl.before_launch()
     _gemv_rows_kernel[(programs,)](
         x, w, out, M, N, K, programs, BM=max(16, triton.next_power_of_2(M)),
         BN=bn, BK=bk if m1 else 128, SWIGLU=swiglu, M1=m1, DOT_F32=_DOT_F32,
-        num_warps=num_warps, num_stages=3,
+        PDL=pdl.compiled(), num_warps=num_warps, num_stages=3,
     )
+    pdl.after_launch()
     return out
 
 

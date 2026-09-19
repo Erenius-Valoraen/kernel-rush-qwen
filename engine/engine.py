@@ -847,8 +847,7 @@ class Engine:
             modes += [(1, "fixed")]
             if self.pdl_ok and n >= 4 and not self._late()                     and self._mega_matches(st, ids, S, steps=8, plan="fixedpdl", ref="fixed"):
                 modes += [(1, "fixedpdl")]
-                if not self._late() and self._mega_matches(
-                        st, ids, S, steps=8, plan="fixedpdlpeel", ref="fixed"):
+                if os.environ.get("ENGINE_PDL_PEEL") == "1" and not self._late()                         and self._mega_matches(st, ids, S, steps=8, plan="fixedpdlpeel", ref="fixed"):
                     modes += [(1, "fixedpdlpeel")]
                 if os.environ.get("ENGINE_PDL_PF") == "1" and pdl.prefetch_ok()                         and not self._late() and self._mega_matches(
                         st, ids, S, steps=8, plan="fixedpdlpf", ref="fixed"):
