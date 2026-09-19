@@ -58,7 +58,8 @@ from kernels.ops import DecodeAttention, add_rmsnorm, qk_norm_rope_cache, silu_m
 PREFILL_TOKENS = 8192      # rows per prefill chunk (whole sequences per chunk)
 LOOKAHEAD = 8              # plain mode: steps enqueued ahead of the one yielded
 MULTI = int(os.environ.get("ENGINE_MULTI", "4"))   # decode steps per graph launch
-SPEC_MARGIN = 0.90         # speculative must beat plain by 10% on warmup
+SPEC_MARGIN = 0.93         # speculative must beat plain by 7% on warmup
+SPEC_MIN_N = int(os.environ.get("ENGINE_SPEC_MIN_N", "64"))   # short outputs: drafts rarely hit
 GEMV_MAX_M = 128           # Triton skinny GEMMs up to this many rows
 SPLIT_QKV, SPLIT_O, SPLIT_DOWN = 2, 4, 4
 CALIBRATION_BUDGET_S = 150.0
@@ -124,9 +125,9 @@ def _spec_candidates(batch):
     if batch == 1:
         return [1, 4, 8]
     if batch <= 4:
-        return [1, 4]
+        return [1, 4, 6]
     if batch <= 16:
-        return [1, 3]
+        return [1, 3, 5]
     if batch <= 32:
         return [1, 2]
     return [1]
@@ -791,9 +792,11 @@ class Engine:
     def _spec(self, st, ids, input_ids, S, n, t, use_gemv, stats=None):
         """Speculative decoding with drafting/acceptance on device: steps are
         replayed back-to-back; the host only streams finished tokens out."""
+        _t0 = time.perf_counter()
         r = st.runner(self, t, use_gemv)
         B = st.batch
         self._prefill(ids, st)
+        _t1 = time.perf_counter()
         r.hist[:, :S].copy_(ids)
         r.hist[:, S].copy_(st.first)
         r.hlen.fill_(S + 1)
@@ -840,12 +843,17 @@ class Engine:
         # Every step yields >= 1 token per unfinished sequence, so never queue
         # more steps than could still be needed.
         launched, done, min_len = 0, 0, 1
-        while launched < min(LOOKAHEAD, n - 1):
-            launch(launched)
-            launched += 1
-        ev0.synchronize()
+        _t2 = time.perf_counter()
+        ev0.synchronize()               # nothing may delay the first token
+        if os.environ.get("ENGINE_TRACE") == "1":
+            _log(f"since generate() start {(time.perf_counter() - self._tg0) * 1e3:.1f}ms")
+            _log(f"spec ttft: prefill-host {(_t1 - _t0) * 1e3:.1f}ms setup {(_t2 - _t1) * 1e3:.1f}ms "
+                 f"sync {(time.perf_counter() - _t2) * 1e3:.1f}ms")
         yield self._spec_first.tolist()
         emitted = 1
+        while launched < min(LOOKAHEAD, max(1, (n - 1) // 2)):
+            launch(launched)
+            launched += 1
         while emitted < n:
             events.pop(done).synchronize()
             slot = done % nslot
@@ -857,7 +865,9 @@ class Engine:
                 for c in range(min_len - emitted):
                     yield [row[c] for row in toks]
                 emitted = min_len
-            while launched < done + LOOKAHEAD and launched - done < n - min_len:
+            # Queue ahead, but not past what the remaining tokens can need (a step
+            # yields 1..T tokens): stale steps would delay the next request.
+            while launched < done + LOOKAHEAD and launched - done < max(1, (n - min_len) // 2):
                 launch(launched)
                 launched += 1
         if stats is not None:
@@ -885,9 +895,9 @@ class Engine:
                 if os.environ.get("ENGINE_PDL_PF") == "1" and pdl.prefetch_ok()                         and not self._late() and self._mega_matches(
                         st, ids, S, steps=8, plan="fixedpdlpf", ref="fixed"):
                     modes += [(1, "fixedpdlpf")]
-            if self.pdl_ok and n >= 4 and not self._late()                     and self._mega_matches(st, ids, S, steps=8, plan="fusedpdl", ref="fixed"):
+            if os.environ.get("ENGINE_FUSED") == "1" and self.pdl_ok and n >= 4 and not self._late()                     and self._mega_matches(st, ids, S, steps=8, plan="fusedpdl", ref="fixed"):
                 modes += [(1, "fusedpdl")]
-            if not self._late() and self._mega_matches(st, ids, S, steps=8, plan="fused", ref="fixed"):
+            if os.environ.get("ENGINE_FUSED") == "1" and not self._late()                     and self._mega_matches(st, ids, S, steps=8, plan="fused", ref="fixed"):
                 modes += [(1, "fused")]
             if os.environ.get("ENGINE_TUNED", "0") == "1":   # never won calibration (telemetry run)
                 modes += [(1, "tuned")]
@@ -895,7 +905,7 @@ class Engine:
                     modes += [(1, "tunedpdl")]
         if not self.cuda and os.environ.get("ENGINE_TEST_GEMV") == "1":
             modes = [(1, "tuned")]
-        spec_ts = [t for t in _spec_candidates(B) if t > 1 and n >= 4 and B == 1
+        spec_ts = [t for t in _spec_candidates(B) if t > 1 and n >= SPEC_MIN_N and B <= 16
                    and os.environ.get("ENGINE_SPEC", "1") == "1"]
         best, best_time, report = (1, False), None, []
         pending = list(modes)
@@ -949,6 +959,7 @@ class Engine:
         n = max_new_tokens
         if n <= 0:
             return
+        self._tg0 = time.perf_counter()
         B, S = len(input_ids), len(input_ids[0])
         tmax = max(_spec_candidates(B))
         self._ensure_rope(-(-(S + n + tmax) // 128) * 128 + 1)
