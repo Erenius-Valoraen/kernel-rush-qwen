@@ -23,7 +23,7 @@ import torch
 import torch.nn.functional as F
 
 PLAN_ORDER = [False, "fixed", "fixedpdl", "tuned", "tunedpdl", "fixedpdlpeel", "fixedpdlpf",
-              "mega", "megapf"]
+              "mega", "megapf", "fused", "fusedpdl"]
 
 
 def _t(fn, reps=5):
@@ -64,9 +64,9 @@ def measure(eng, st, S, n):
     out = dict(step_us=0.0, gemv_us=0.0, attn_us=0.0, norm_us=0.0, plan_idx=0)
     try:
         t, g = st.mode
-        out["plan_idx"] = PLAN_ORDER.index(g) if g in PLAN_ORDER else 8
+        out["plan_idx"] = PLAN_ORDER.index(g) if g in PLAN_ORDER else 12
         if t > 1:
-            out["plan_idx"] += 10
+            out["plan_idx"] += 20
         r = st.runner(eng, 1, g)
         M = st.batch
         dev = eng.device
@@ -76,7 +76,7 @@ def measure(eng, st, S, n):
                     r.pos.fill_(S)
                     r.graph.replay()
                 out["step_us"] = _t(step)
-            base = "fixed" if g in ("fixedpdl", "fixedpdlpeel", "fixedpdlpf") else g
+            base = "fixed" if g in ("fixedpdl", "fixedpdlpeel", "fixedpdlpf", "fused", "fusedpdl") else g
             if base == "tunedpdl":
                 base = "tuned"
             if base == "tuned":

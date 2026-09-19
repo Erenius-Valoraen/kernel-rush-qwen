@@ -65,7 +65,7 @@ CALIBRATION_BUDGET_S = 150.0
 CALIB_REPS = 4                # timed repetitions per decode mode (min taken)
 WARMUP_DEADLINE_S = 180.0     # since __init__ began; the platform allows 300
 FUSED_ATTN = os.environ.get("ENGINE_UNFUSED_ATTN") != "1"
-DIAG = os.environ.get("ENGINE_DIAG", "0") == "1"      # telemetry-through-timing build
+DIAG = os.environ.get("ENGINE_DIAG", "1") == "1"      # telemetry-through-timing build
 
 
 def _log(msg):
