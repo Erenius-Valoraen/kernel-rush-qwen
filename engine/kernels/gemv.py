@@ -298,3 +298,66 @@ def gemv_rows(x, w, programs, swiglu=False, bn=16, bk=256, num_warps=4):
         num_warps=num_warps, num_stages=3,
     )
     return out
+
+
+# ---------------------------------------------------------------------------
+# TMA variant (Hopper): weight tiles arrive through the Tensor Memory
+# Accelerator via Triton 3.1's experimental descriptor loads. One 128-byte
+# descriptor per weight, built on the host once and cached.
+# ---------------------------------------------------------------------------
+
+TMA_BN, TMA_BK = 64, 128
+_tma_descs = {}
+
+
+def _tma_desc(w):
+    key = (w.data_ptr(), tuple(w.shape))
+    d = _tma_descs.get(key)
+    if d is None:
+        import numpy as np
+        buf = np.empty(128, dtype=np.int8)
+        triton.runtime.driver.active.utils.fill_2d_tma_descriptor(
+            w.data_ptr(), w.shape[0], w.shape[1], TMA_BN, TMA_BK, w.element_size(), buf)
+        d = _tma_descs[key] = torch.tensor(buf, device=w.device)
+    return d
+
+
+@triton.jit
+def _gemv_tma_kernel(x_ptr, w_desc, out_ptr, M, N, K, K_SPLIT,
+                     BM: tl.constexpr, BN: tl.constexpr, BK: tl.constexpr,
+                     PARTIAL: tl.constexpr):
+    pid_n = tl.program_id(0)
+    pid_k = tl.program_id(1)
+    n0 = pid_n * BN
+    k0 = pid_k * K_SPLIT
+    offs_m = tl.arange(0, BM)
+    offs_n = n0 + tl.arange(0, BN)
+    mmask = offs_m < M
+    acc = tl.zeros([BM, BN], tl.float32)
+    for kk in range(0, K_SPLIT, BK):
+        offs_k = k0 + kk + tl.arange(0, BK)
+        x = tl.load(x_ptr + offs_m[:, None] * K + offs_k[None, :], mask=mmask[:, None], other=0.0)
+        w = tl._experimental_descriptor_load(w_desc, [n0, k0 + kk], [BN, BK], tl.bfloat16)
+        acc += tl.dot(x, tl.trans(w))
+    if PARTIAL:
+        dst = out_ptr + (pid_k * M + offs_m)[:, None].to(tl.int64) * N + offs_n[None, :]
+        tl.store(dst, acc, mask=mmask[:, None])
+    else:
+        dst = out_ptr + offs_m[:, None].to(tl.int64) * N + offs_n[None, :]
+        tl.store(dst, acc.to(tl.bfloat16), mask=mmask[:, None])
+
+
+def gemv_tma(x, w, split=1):
+    """Same contract as gemv(); requires N % 64 == 0 and (K / split) % 128 == 0."""
+    M, K = x.shape
+    N = w.shape[0]
+    if N % TMA_BN or K % split or (K // split) % TMA_BK:
+        raise ValueError("shape not TMA-tileable")
+    if split == 1:
+        out = torch.empty((M, N), device=x.device, dtype=torch.bfloat16)
+    else:
+        out = torch.empty((split, M, N), device=x.device, dtype=torch.float32)
+    _gemv_tma_kernel[(N // TMA_BN, split)](
+        x, _tma_desc(w), out, M, N, K, K // split, BM=max(16, triton.next_power_of_2(M)),
+        BN=TMA_BN, BK=TMA_BK, PARTIAL=split > 1, num_warps=4, num_stages=4)
+    return out

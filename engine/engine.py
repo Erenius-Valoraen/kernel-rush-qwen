@@ -29,7 +29,7 @@ from transformers import AutoModelForCausalLM
 
 from kernels.fused_attn import FusedDecodeAttention
 from kernels.mlp import PersistentMLP
-from kernels.gemv import gemv, gemv_m1, gemv_m1_swiglu, gemv_rows, gemv_swiglu
+from kernels.gemv import gemv, gemv_m1, gemv_m1_swiglu, gemv_rows, gemv_swiglu, gemv_tma
 from kernels.spec import accept as spec_accept, draft as spec_draft
 from kernels.ops import DecodeAttention, add_rmsnorm, qk_norm_rope_cache, silu_mul
 
@@ -53,6 +53,7 @@ def _repeat_kv(x, n_rep):
 
 
 _NUM_SMS = 132
+_TMA_OK = False
 
 
 def _gemm_candidates(name, M):
@@ -62,11 +63,14 @@ def _gemm_candidates(name, M):
     if name == "gu":
         c = ["cublas", "tr"] + rows
         return c + ["m1"] if M == 1 else c
+    tma = ["tma1"] if _TMA_OK else []
     if name == "lm":
-        c = ["cublas", "tr1"] + rows
+        c = ["cublas", "tr1"] + rows + tma
         return c + ["m1_1"] if M == 1 else c
     splits = {"qkv": (1, 2, 4), "o": (1, 2, 4, 8), "down": (1, 2, 4, 8)}[name]
     c = ["cublas"] + [f"tr{s}" for s in splits] + rows
+    if _TMA_OK:
+        c += [f"tma{s}" for s in splits]
     if M == 1:
         c += [f"m1_{s}" for s in splits]
     return c
@@ -81,6 +85,8 @@ def _gemm_run(name, cand, x, w):
         return gemv_m1_swiglu(x, w) if cand == "m1" else gemv_swiglu(x, w)
     if cand == "cublas":
         return F.linear(x, w)
+    if cand.startswith("tma"):
+        return gemv_tma(x, w, int(cand[3:]))
     if cand.startswith("m1_"):
         return gemv_m1(x, w, int(cand[3:]))
     return gemv(x, w, int(cand[2:]))
@@ -214,8 +220,10 @@ class Engine:
         self.eps = cfg.rms_norm_eps
         self.num_sms = (torch.cuda.get_device_properties(self.device).multi_processor_count
                         if self.cuda else 132)
-        global _NUM_SMS
+        global _NUM_SMS, _TMA_OK
         _NUM_SMS = self.num_sms if self.cuda else 4
+        _TMA_OK = (self.cuda and torch.cuda.get_device_capability(self.device)[0] == 9
+                   and os.environ.get("ENGINE_NO_TMA") != "1")
 
         base = model.model
         self.rotary = base.rotary_emb
