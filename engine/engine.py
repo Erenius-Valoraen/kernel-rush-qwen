@@ -53,7 +53,7 @@ from kernels.mega import MegaDecode
 from kernels.mlp import PersistentMLP
 from kernels.prefill_mlp import gu_swiglu
 from kernels import fp8
-from kernels.fp8 import ActScale, linear_fp8, quantize_weight
+from kernels.fp8 import ActScale, SharedScale, linear_fp8, quantize_weight
 from kernels.fused_gemv import FusedLayerBuffers, gemv_fused, gemv_swiglu_fused
 from kernels.gemv import gemv, gemv_m1, gemv_m1_swiglu, gemv_rows, gemv_swiglu, gemv_tma
 from kernels.spec import accept as spec_accept, draft as spec_draft
@@ -75,9 +75,11 @@ WARMUP_DEADLINE_S = 180.0     # since __init__ began; the platform allows 300
 FUSED_ATTN = os.environ.get("ENGINE_UNFUSED_ATTN") != "1"
 LAST_LAYER_TRIM = os.environ.get("ENGINE_NO_TRIM") != "1"
 # prefill GEMMs run in FP8 (organisers allow FP8 compute); decode stays bf16
-FP8_SITES = tuple(filter(None, re.split("[,:]", os.environ.get("ENGINE_FP8", "qkv,o,gu,down"))))
+FP8_SITES = tuple(filter(None, re.split("[,:]", os.environ.get("ENGINE_FP8", "gu"))))
 FP8_SKIP = tuple(int(v) for v in re.split("[,:]", os.environ.get("ENGINE_FP8_SKIP", "0:0")))   # leading, trailing bf16 layers
-FP8_DECODE = os.environ.get("ENGINE_FP8_DECODE", "0") == "1"   # gate/up + down in FP8 at decode, M >= 4
+FP8_DECODE = os.environ.get("ENGINE_FP8_DECODE", "1") == "1"   # gate/up + down in FP8 at decode, M >= 4
+FP8_DEC_SITES = tuple(re.split("[,:]", os.environ.get("ENGINE_FP8_DEC_SITES", "gu")))
+FP8_DECODE_HEADROOM = float(os.environ.get("ENGINE_FP8_DECODE_HEADROOM", "2"))
 FP8_MIN_ROWS = int(os.environ.get("ENGINE_FP8_MIN_ROWS", "256"))
 DIAG = os.environ.get("ENGINE_DIAG", "0") == "1"      # telemetry-through-timing build
 
@@ -347,7 +349,12 @@ class Engine:
                 if self.cuda:
                     torch.cuda.empty_cache()
         self.fp8_ok = False
-        self.fp8_act = {}        # (layer, site) -> static activation scale
+        self.fp8_dec_layers = set()
+        # decode FP8 scales come from the current prompt's prefill: running max per
+        # (layer, gu/down input), turned into inv/scale at the end of each prefill
+        self.fp8_amax = torch.zeros((self.n_layers, 2), device=self.device, dtype=torch.float32)
+        self.fp8_inv = torch.ones_like(self.fp8_amax)
+        self.fp8_scale = torch.ones_like(self.fp8_amax)
         if self.cuda and FP8_SITES and torch.cuda.get_device_capability(self.device) >= (8, 9):
             try:
                 with torch.no_grad():
@@ -356,6 +363,8 @@ class Engine:
                             L[key + "8"] = quantize_weight(L[key])
                 fp8.pick_cast(_log)
                 self.fp8_ok = True
+                if FP8_DECODE:      # the last layer is trimmed in prefill: no scales for it
+                    self.fp8_dec_layers = set(range(self.n_layers - 1))
             except Exception as e:  # pragma: no cover
                 _log(f"fp8 weights unavailable: {e!r}")
         self.mega_ok = (tied and (self.cuda or os.environ.get("ENGINE_TEST_MEGA") == "1")
@@ -468,6 +477,7 @@ class Engine:
         B, S = ids.shape
         per = max(1, PREFILL_TOKENS // S)
         nq, nkv, d = self.nq, self.nkv, self.d
+        self.fp8_amax.zero_()
         for b0 in range(0, B, per):
             g = min(per, B - b0)
             x = F.embedding(ids[b0:b0 + g].reshape(-1), self.embed)
@@ -493,33 +503,38 @@ class Engine:
                     a = self._prefill_attn2(q, kc, vc, S, b0, g)
                     o = self._pf_linear(a, li, "o") if self._pf_fp8(a, "o", li) else F.linear(a, L["o"])
                     h = add_rmsnorm(x, o, L["ln2"], self.eps)
-                    self._fp8_record(li, "gu", h)
                     if self._pf_fp8(h, "gu", li):
-                        act = silu_mul(self._pf_linear(h, li, "gu"))
+                        act = silu_mul(self._pf_linear(h, li, "gu", 0))
                     else:
+                        if li in self.fp8_dec_layers:
+                            slot = self.fp8_amax[li][0:1]
+                            slot.copy_(torch.maximum(slot, ActScale(h).amax.reshape(1)))
                         act = self._prefill_gu(h, L["gu"])
-                    self._fp8_record(li, "down", act)
-                    delta = self._pf_linear(act, li, "down") if self._pf_fp8(act, "down", li) else F.linear(act, L["down"])
+                    if self._pf_fp8(act, "down", li):
+                        delta = self._pf_linear(act, li, "down", 1)
+                    else:
+                        if li in self.fp8_dec_layers and "down" in FP8_DEC_SITES:   # decode needs this range
+                            slot = self.fp8_amax[li][1:2]
+                            slot.copy_(torch.maximum(slot, ActScale(act).amax.reshape(1)))
+                        delta = F.linear(act, L["down"])
             if not LAST_LAYER_TRIM:
                 xl = x.view(g, S, -1)[:, -1].contiguous()
                 dl = delta.view(g, S, -1)[:, -1].contiguous()
             h = add_rmsnorm(xl, dl, self.final_norm, self.eps)
             logits = F.linear(h, self.lm_head)
             st.first[b0:b0 + g] = torch.argmax(logits, dim=-1)
-
-    def _fp8_record(self, li, key, x):
-        """First eager prefill: keep this site's activation scale for the FP8 decode plan."""
-        if (self.fp8_ok and FP8_DECODE and (li, key) not in self.fp8_act
-                and not torch.cuda.is_current_stream_capturing()):
-            self.fp8_act[(li, key)] = ActScale(x, 4.0)
+        amax = (self.fp8_amax * FP8_DECODE_HEADROOM).clamp_min(1e-6)
+        self.fp8_inv.copy_(448.0 / amax)
+        self.fp8_scale.copy_(amax / 448.0)
 
     def _pf_fp8(self, x, key, li):
         return (self.fp8_ok and key in FP8_SITES and x.shape[0] >= FP8_MIN_ROWS
                 and FP8_SKIP[0] <= li < self.n_layers - FP8_SKIP[1])
 
-    def _pf_linear(self, x, li, key):
+    def _pf_linear(self, x, li, key, slot=None):
         """Prefill GEMM in FP8, activation scaled by its own range."""
-        return linear_fp8(x, self.layers[li][key + "8"])
+        out = self.fp8_amax[li][slot:slot + 1] if slot is not None and FP8_DECODE else None
+        return linear_fp8(x, self.layers[li][key + "8"], amax_out=out)
 
     def _prefill_gu(self, h, w):
         """SwiGLU(h @ [Wg; Wu]^T) for prefill: cuBLAS + separate SiLU kernel, or
@@ -815,10 +830,16 @@ class Engine:
             qkv = gemv(h, L["qkv"], SPLIT_QKV)
             a = self._attend(qkv, L, st.k_cache[li], st.v_cache[li], pos, t, attn)
             h = add_rmsnorm(x, gemv(a, L["o"], SPLIT_O), L["ln2"], self.eps)
-            ag, ad = self.fp8_act.get((li, "gu")), self.fp8_act.get((li, "down"))
-            if ag is not None and ad is not None:
-                act = silu_mul(linear_fp8(h, L["gu8"], ag))
-                delta = linear_fp8(act, L["down8"], ad)
+            if li in self.fp8_dec_layers:
+                inv, sc = self.fp8_inv[li], self.fp8_scale[li]
+                if "gu" in FP8_DEC_SITES:
+                    act = silu_mul(linear_fp8(h, L["gu8"], SharedScale(inv[0:1], sc[0])))
+                else:
+                    act = gemv_swiglu(h, L["gu"])
+                if "down" in FP8_DEC_SITES:
+                    delta = linear_fp8(act, L["down8"], SharedScale(inv[1:2], sc[1]))
+                else:
+                    delta = gemv(act, L["down"], SPLIT_DOWN)
             else:
                 delta = gemv(gemv_swiglu(h, L["gu"]), L["down"], SPLIT_DOWN)
             nw = self.layers[li + 1]["ln1"] if li + 1 < n else self.final_norm
@@ -1007,8 +1028,6 @@ class Engine:
         B = st.batch
         start = time.perf_counter()
         gemv_ok = self.cuda and os.environ.get("ENGINE_NO_GEMV") != "1"
-        if self.fp8_ok and FP8_DECODE and (0, "down") not in self.fp8_act:
-            self._prefill(ids, st)          # measures the activation scales
         modes = [(1, False)]
         if self.mega_ok and B <= 16 and n >= 4:
             for plan in filter(None, os.environ.get("ENGINE_MEGA_PLANS", "").split(",")):
@@ -1016,7 +1035,7 @@ class Engine:
                     modes.append((1, plan))
         if gemv_ok and B <= GEMV_MAX_M:
             modes += [(1, "fixed")]
-            if self.fp8_ok and FP8_DECODE and B >= 4 and (0, "down") in self.fp8_act:
+            if self.fp8_dec_layers and B >= 4:
                 modes += [(1, "fp8")]
             if self.pdl_ok and n >= 4 and not self._late()                     and self._mega_matches(st, ids, S, steps=8, plan="fixedpdl", ref="fixed"):
                 modes += [(1, "fixedpdl")]

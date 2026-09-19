@@ -30,6 +30,7 @@ class ActScale:
     def __init__(self, x, headroom=1.0):
         mn, mx = torch.aminmax(x)
         amax = torch.maximum(-mn, mx).float().clamp_min(1e-6) * headroom
+        self.amax = amax
         self.inv = (FP8_MAX / amax).reshape(1)             # fp32, on device
         self.scale = (amax / FP8_MAX).reshape(())
 
@@ -86,11 +87,20 @@ def pick_cast(log):
         log(f"fp8 triton cast unavailable: {e!r}")
 
 
-def linear_fp8(x, q, a=None):
-    """bf16 [M, N] ~= x @ W^T with q = quantize_weight(W); a = static ActScale, or
-    None to scale by this tensor's own range."""
+class SharedScale:
+    """Scale slots living in caller-owned device tensors (read by decode graphs)."""
+
+    def __init__(self, inv, scale):
+        self.inv, self.scale = inv, scale
+
+
+def linear_fp8(x, q, a=None, amax_out=None):
+    """bf16 [M, N] ~= x @ W^T with q = quantize_weight(W); a = given scale, or
+    None to scale by this tensor's own range (running max kept in amax_out)."""
     w8, ws = q
     if a is None:
         a = ActScale(x)
+        if amax_out is not None:
+            amax_out.copy_(torch.maximum(amax_out, a.amax.reshape(1)))
     return torch._scaled_mm(_cast(x, a), w8.t(), scale_a=a.scale, scale_b=ws,
                             out_dtype=torch.bfloat16)
