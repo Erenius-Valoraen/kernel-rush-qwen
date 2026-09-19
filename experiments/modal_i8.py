@@ -75,7 +75,7 @@ def get(name):
     with safe_open(os.path.join(root, index[name]), "pt", device="cuda") as f:
         return f.get_tensor(name)
 L = "model.layers.17."
-mats = {"gu": (torch.cat([get(L + "mlp.gate_proj.weight"), get(L + "mlp.up_proj.weight")], 0).contiguous(), 1),
+mats = {"o": (get(L + "self_attn.o_proj.weight"), 4), "gu": (torch.cat([get(L + "mlp.gate_proj.weight"), get(L + "mlp.up_proj.weight")], 0).contiguous(), 1),
         "down": (get(L + "mlp.down_proj.weight"), 4),
         "qkv": (torch.cat([get(L + f"self_attn.{n}_proj.weight") for n in "qkv"], 0).contiguous(), 2)}
 for name, (w, split) in mats.items():
@@ -84,20 +84,13 @@ for name, (w, split) in mats.items():
     w8 = torch.round(wf / s[:, None]).clamp_(-127, 127).to(torch.int8).contiguous()
     rel = (((w8.float() * s[:, None]) - wf).norm() / wf.norm()).item()
     print(f"RESULT {name} [{N},{K}] int8 weight rel err {rel:.4f}", flush=True)
-    q8 = (wf / (wf.abs().max() / 448)).to(torch.float8_e4m3fn)
-    sw = (wf.abs().max() / 448).float().reshape(())
-    for M in (1, 4, 16, 32, 64, 128, 512, 8192):
-        x = torch.randn(M, K, device="cuda", dtype=torch.bfloat16) * 0.1
-        sx = (x.abs().max().float() / 448).reshape(())
-        x8 = (x.float() / sx).to(torch.float8_e4m3fn)
-        reps = 36 if M <= 128 else 8
-        t0 = tg(lambda: F.linear(x, w), reps)
-        tt = tg(lambda: gemv(x, w, split), reps) if M <= 128 else 0
-        try:
-            t1 = tg(lambda: torch._scaled_mm(x8, q8.t(), scale_a=sx, scale_b=sw, out_dtype=torch.bfloat16), reps)
-        except Exception as e:
-            t1 = -1; print("ERR", repr(e)[-300:])
-        print(f"RESULT   M={M}: cublas {t0:.1f}us  triton-bf16 {tt:.1f}us  fp8 scaled_mm {t1:.1f}us", flush=True)
+    from kernels.i8 import quantize_rows, gemv_i8
+    q = quantize_rows(w)
+    for sp in ((1, 2, 4) if name != "gu" else (1,)):
+        for M in (4, 16, 32, 64):
+            x = torch.randn(M, K, device="cuda", dtype=torch.bfloat16) * 0.1
+            t0 = tg(lambda: gemv(x, w, sp)); t1 = tg(lambda: gemv_i8(x, q, sp))
+            print(f"RESULT   split={sp} M={M}: bf16 {t0:.1f}us  int8 {t1:.1f}us  ({t0 / t1:.2f}x)", flush=True)
 '''
 
 @app.function(gpu="H100", timeout=1500, volumes={"/weights": vol})
