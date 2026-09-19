@@ -190,10 +190,41 @@ def _fused_attn_kernel(qkv_ptr, qw_ptr, kw_ptr, cos_ptr, sin_ptr,
 class FusedDecodeAttention(DecodeAttention):
     """Norm + RoPE + cache write + attention + combine for T tokens per sequence."""
 
+    # (BLOCK_N, num_warps, num_stages) candidates, picked by timing once
+    CONFIGS = [(64, 4, 2), (128, 8, 3), (64, 4, 3)]
+
     def __init__(self, batch, t, capacity, nq, nkv, d, device, num_sms):
         super().__init__(batch, t, capacity, nq, nkv, d, device, num_sms)
         self.cnt = torch.zeros((batch * nkv,), device=device, dtype=torch.int32)
         self.tpad = max(2, triton.next_power_of_2(t))
+        self.cfg = self.CONFIGS[0]
+        self.tuned = False
+
+    def tune(self, qkv, q_w, k_w, cos, sin, k_cache, v_cache, pos_t, eps):
+        """Pick the fastest config at the current positions (call outside graph
+        capture, with positions at the longest context of interest)."""
+        if self.tuned or _DOT_F32:
+            return
+        self.tuned = True
+        best, best_t = self.cfg, None
+        for cfg in self.CONFIGS:
+            try:
+                self.cfg = cfg
+                self(qkv, q_w, k_w, cos, sin, k_cache, v_cache, pos_t, eps)
+                torch.cuda.synchronize()
+                e0 = torch.cuda.Event(enable_timing=True)
+                e1 = torch.cuda.Event(enable_timing=True)
+                e0.record()
+                for _ in range(10):
+                    self(qkv, q_w, k_w, cos, sin, k_cache, v_cache, pos_t, eps)
+                e1.record()
+                e1.synchronize()
+                t = e0.elapsed_time(e1)
+                if best_t is None or t < best_t:
+                    best, best_t = cfg, t
+            except Exception:  # pragma: no cover
+                pass
+        self.cfg = best
 
     def __call__(self, qkv, q_w, k_w, cos, sin, k_cache, v_cache, pos_t, eps):
         """qkv: bf16 [B*T, W] or fp32 split-K partials [S, B*T, W]. Returns [B*T, NQ*D]."""
@@ -206,7 +237,7 @@ class FusedDecodeAttention(DecodeAttention):
             self.o, self.m, self.l, self.cnt, out,
             k_cache.stride(0), k_cache.stride(1), M * W, self.scale, eps, self.chunk,
             NKV=self.nkv, GROUP=self.group, T=T, RPAD=self.rpad, TPAD=self.tpad,
-            D=self.d, BLOCK_N=64, NSPLIT=self.nsplit, QSPLIT=qsplit,
-            DOT_F32=_DOT_F32, FENCE=not _DOT_F32, num_warps=4, num_stages=2,
+            D=self.d, BLOCK_N=self.cfg[0], NSPLIT=self.nsplit, QSPLIT=qsplit,
+            DOT_F32=_DOT_F32, FENCE=not _DOT_F32, num_warps=self.cfg[1], num_stages=self.cfg[2],
         )
         return out

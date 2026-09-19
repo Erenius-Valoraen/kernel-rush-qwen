@@ -526,6 +526,9 @@ class Engine:
 
     def _attend(self, qkv, L, kc, vc, pos, t, attn):
         if FUSED_ATTN:
+            if (not attn.tuned and self.cuda
+                    and not torch.cuda.is_current_stream_capturing()):
+                attn.tune(qkv, L["qn"], L["kn"], self.cos, self.sin, kc, vc, pos, self.eps)
             return attn(qkv, L["qn"], L["kn"], self.cos, self.sin, kc, vc, pos, self.eps)
         q = qk_norm_rope_cache(qkv, L["qn"], L["kn"], self.cos, self.sin, kc, vc,
                                pos, t, 0, self.eps, self.nq, self.nkv, self.d)
