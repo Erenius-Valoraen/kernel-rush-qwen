@@ -1,0 +1,13 @@
+# The timing container's versions, pinned. Install these locally only to
+# reproduce the runtime on your own H100; the container already has them and
+# has no network, so nothing here is installed at submission time.
+#
+#   pip install -r requirements.txt --extra-index-url https://download.pytorch.org/whl/cu124
+#
+# Python 3.11, CUDA 12.4. torch pulls triton on Linux; it is pinned here
+# because engines import it directly.
+torch==2.5.1
+triton==3.1.0
+transformers==4.51.3
+safetensors==0.5.3
+tokenizers==0.21.1
