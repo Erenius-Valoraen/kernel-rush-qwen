@@ -271,7 +271,7 @@ class Engine:
         global _NUM_SMS, _TMA_OK
         _NUM_SMS = self.num_sms if self.cuda else 4
         _TMA_OK = (self.cuda and torch.cuda.get_device_capability(self.device)[0] == 9
-                   and os.environ.get("ENGINE_TMA", "1") == "1")
+                   and os.environ.get("ENGINE_TMA") == "1")  # crashed on H100 (v20)
 
         base = model.model
         self.rotary = base.rotary_emb
