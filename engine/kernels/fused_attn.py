@@ -50,8 +50,6 @@ def _norm_rope_half(x1, x2, w_ptr, cos_ptr, sin_ptr, pos, offs_h, mask2,
     return o1, o2
 
 
-@triton.autotune(configs=_CONFIGS, key=["CHUNK", "T", "NSPLIT", "RPAD", "QSPLIT"],
-                 warmup=5, rep=20)
 @triton.jit
 def _fused_attn_kernel(qkv_ptr, qw_ptr, kw_ptr, cos_ptr, sin_ptr,
                        kc_ptr, vc_ptr, pos_ptr, o_ptr, m_ptr, l_ptr, cnt_ptr, out_ptr,
@@ -197,6 +195,7 @@ class FusedDecodeAttention(DecodeAttention):
             self.o, self.m, self.l, self.cnt, out,
             k_cache.stride(0), k_cache.stride(1), M * W, self.scale, eps, self.chunk,
             NKV=self.nkv, GROUP=self.group, T=T, RPAD=self.rpad, TPAD=self.tpad,
-            D=self.d, NSPLIT=self.nsplit, QSPLIT=qsplit, DOT_F32=_DOT_F32,
+            D=self.d, BLOCK_N=64, NSPLIT=self.nsplit, QSPLIT=qsplit,
+            DOT_F32=_DOT_F32, num_warps=4, num_stages=2,
         )
         return out

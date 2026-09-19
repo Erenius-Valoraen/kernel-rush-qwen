@@ -23,6 +23,24 @@ import os
 import sys
 import time
 
+# Every workload runs in a fresh process of the same container: share Triton's
+# compile cache across them so kernels compile once per run, not per workload.
+def _shared_triton_cache(path="/tmp/kernel_rush_triton_cache"):
+    if "TRITON_CACHE_DIR" in os.environ:
+        return
+    try:
+        os.makedirs(path, exist_ok=True)
+        probe = os.path.join(path, f".probe{os.getpid()}")
+        with open(probe, "w") as f:
+            f.write("ok")
+        os.remove(probe)
+        os.environ["TRITON_CACHE_DIR"] = path
+    except OSError:
+        pass
+
+
+_shared_triton_cache()
+
 import torch
 import torch.nn.functional as F
 from transformers import AutoModelForCausalLM
@@ -717,14 +735,17 @@ class Engine:
         gemv_ok = self.cuda and os.environ.get("ENGINE_NO_GEMV") != "1"
         modes = [(1, False)]
         if self.mega_ok and B <= 16 and n >= 4:
-            for plan in ("mega", "megapf"):
+            for plan in os.environ.get("ENGINE_MEGA_PLANS", "mega").split(","):
                 if not self._late() and self._mega_matches(st, ids, S, plan=plan):
                     modes.append((1, plan))
         if gemv_ok and B <= GEMV_MAX_M:
-            modes += [(1, "fixed"), (1, "tuned")]
+            modes += [(1, "fixed")]
+            if os.environ.get("ENGINE_TUNED") == "1":
+                modes += [(1, "tuned")]
         if not self.cuda and os.environ.get("ENGINE_TEST_GEMV") == "1":
             modes = [(1, "tuned")]
-        spec_ts = [t for t in _spec_candidates(B) if t > 1 and n >= 4 and B == 1]
+        spec_ts = [t for t in _spec_candidates(B) if t > 1 and n >= 4 and B == 1
+                   and os.environ.get("ENGINE_SPEC") == "1"]
         best, best_time, report = (1, False), None, []
         pending = list(modes)
         while pending:
