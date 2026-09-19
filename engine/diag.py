@@ -14,7 +14,7 @@ those quantities can be read back from the report:
   B = 2000 + gemv_us / 5     (all 145 matmuls of the plan, back-to-back)
   C = 4000 + attn_us / 5     (36 fused attention launches, back-to-back)
   P = 10 * plan_idx + norm_us / 100   (72 residual+RMSNorm launches)
-All in ms. Such a run fails the latency gates and never ranks.
+All in ms; total time also contains (n-1)*P. Such a run fails the latency gates and never ranks.
 """
 
 import time
@@ -40,6 +40,23 @@ def _t(fn, reps=5):
         dt = e0.elapsed_time(e1) * 1e3
         best = dt if best is None else min(best, dt)
     return best
+
+
+def _tg(fn, reps=5):
+    """Device time of fn's launches, replayed from a CUDA graph (no host gaps)."""
+    fn()
+    torch.cuda.synchronize()
+    side = torch.cuda.Stream()
+    side.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(side):
+        fn()
+    torch.cuda.current_stream().wait_stream(side)
+    torch.cuda.synchronize()
+    g = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(g):
+        fn()
+    torch.cuda.synchronize()
+    return _t(g.replay, reps)
 
 
 def measure(eng, st, S, n):
@@ -81,7 +98,7 @@ def measure(eng, st, S, n):
                     _gemm_run("gu", plan["gu"], h, L["gu"])
                     _gemm_run("down", plan["down"], act, L["down"])
                 _gemm_run("lm", plan["lm"], h, eng.lm_head)
-            out["gemv_us"] = _t(gemvs, 3)
+            out["gemv_us"] = _tg(gemvs)
 
             L0 = eng.layers[0]
             qkv = _gemm_run("qkv", plan["qkv"], h, L0["qkv"])
@@ -90,7 +107,7 @@ def measure(eng, st, S, n):
             def attns():
                 for li, L in enumerate(eng.layers):
                     eng._attend(qkv, L, st.k_cache[li], st.v_cache[li], pos, 1, r.attn)
-            out["attn_us"] = _t(attns, 3)
+            out["attn_us"] = _tg(attns)
 
             x = torch.randn((M, H), device=dev, dtype=torch.bfloat16)
             delta = torch.randn((4, M, H), device=dev, dtype=torch.float32) * 0.1
@@ -99,7 +116,7 @@ def measure(eng, st, S, n):
                 for L in eng.layers:
                     add_rmsnorm(x, delta, L["ln1"], eng.eps)
                     add_rmsnorm(x, delta, L["ln2"], eng.eps)
-            out["norm_us"] = _t(norms, 3)
+            out["norm_us"] = _tg(norms)
     except Exception as e:  # pragma: no cover
         out["err"] = repr(e)
     return out
