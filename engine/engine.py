@@ -40,7 +40,7 @@ SPEC_MARGIN = 0.85         # speculative must beat plain by 15% on warmup
 GEMV_MAX_M = 128           # Triton skinny GEMMs up to this many rows
 SPLIT_QKV, SPLIT_O, SPLIT_DOWN = 2, 4, 4
 CALIBRATION_BUDGET_S = 150.0
-WARMUP_DEADLINE_S = 200.0     # since __init__ began; the platform allows 300
+WARMUP_DEADLINE_S = 180.0     # since __init__ began; the platform allows 300
 FUSED_ATTN = os.environ.get("ENGINE_UNFUSED_ATTN") != "1"
 
 
@@ -117,11 +117,12 @@ class _Runner:
         self.use_gemv = use_gemv
         B = st.batch
         cls = FusedDecodeAttention if FUSED_ATTN else DecodeAttention
-        if use_gemv == "mega":
+        if use_gemv in ("mega", "megapf"):
             cls = FusedDecodeAttention
         self.attn = cls(B, t, st.capacity, eng.nq, eng.nkv, eng.d, dev, eng.num_sms)
-        self.mega = (MegaDecode(eng, st, self.attn, eng.num_sms if eng.cuda else 1)
-                     if use_gemv == "mega" else None)
+        self.mega = (MegaDecode(eng, st, self.attn, eng.num_sms if eng.cuda else 1,
+                                prefetch=use_gemv == "megapf")
+                     if use_gemv in ("mega", "megapf") else None)
         self.pos = torch.zeros((B,), device=dev, dtype=torch.int32)
         if t == 1:
             self.tok = torch.zeros((B,), device=dev, dtype=torch.int64)
@@ -307,13 +308,13 @@ class Engine:
         self.state = _State(self, batch, capacity)
         return self.state
 
-    def _mega_matches(self, st, ids, S, steps=4):
+    def _mega_matches(self, st, ids, S, steps=4, plan="mega"):
         """Run a few real decode steps through the cuBLAS path and the
         megakernel from the same prefill; accept only identical tokens."""
         try:
             outs = []
-            for plan in (False, "mega"):
-                r = st.runner(self, 1, plan)
+            for pl in (False, plan):
+                r = st.runner(self, 1, pl)
                 self._prefill(ids, st)
                 r.tok.copy_(st.first)
                 r.pos.fill_(S)
@@ -323,7 +324,7 @@ class Engine:
                     toks.append(r.tok.clone())
                 outs.append(torch.stack(toks))
             ok = bool(torch.equal(outs[0], outs[1]))
-            _log(f"megakernel validation: {'ok' if ok else 'MISMATCH'}")
+            _log(f"megakernel ({plan}) validation: {'ok' if ok else 'MISMATCH'}")
             return ok
         except Exception as e:  # pragma: no cover
             _log(f"megakernel unavailable: {e!r}")
@@ -715,10 +716,12 @@ class Engine:
         start = time.perf_counter()
         gemv_ok = self.cuda and os.environ.get("ENGINE_NO_GEMV") != "1"
         modes = [(1, False)]
+        if self.mega_ok and B <= 16 and n >= 4:
+            for plan in ("mega", "megapf"):
+                if not self._late() and self._mega_matches(st, ids, S, plan=plan):
+                    modes.append((1, plan))
         if gemv_ok and B <= GEMV_MAX_M:
             modes += [(1, "fixed"), (1, "tuned")]
-        if self.mega_ok and B <= 16 and n >= 4 and self._mega_matches(st, ids, S):
-            modes.append((1, "mega"))
         if not self.cuda and os.environ.get("ENGINE_TEST_GEMV") == "1":
             modes = [(1, "tuned")]
         spec_ts = [t for t in _spec_candidates(B) if t > 1 and n >= 4 and B == 1]

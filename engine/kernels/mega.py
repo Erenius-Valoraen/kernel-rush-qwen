@@ -35,6 +35,22 @@ def _wait(ptr, target):
 
 
 @triton.jit
+def _prefetch_rows(w_ptr, r0, r1, K, MAXR: tl.constexpr, PREFETCH: tl.constexpr):
+    """Ask the TMA unit to pull rows [r0, min(r1, r0 + MAXR)) of a row-major
+    bf16 [*, K] weight into L2 (Hopper cp.async.bulk.prefetch). Fire-and-forget:
+    overlaps the next phase's weight fetch with the dependency wait."""
+    if PREFETCH:
+        offs = r0 + tl.arange(0, MAXR)
+        live = (offs < r1).to(tl.int32)
+        addr = (w_ptr + offs.to(tl.int64) * K).to(tl.int64)
+        nbytes = tl.full([MAXR], 0, tl.int32) + K * 2
+        tl.inline_asm_elementwise(
+            "{ .reg .pred p; setp.ne.b32 p, $2, 0; "
+            "@p cp.async.bulk.prefetch.L2.global [$1], $3; mov.u32 $0, 0; }",
+            "=r,l,r,r", [addr, live, nbytes], dtype=tl.int32, is_pure=False, pack=1)
+
+
+@triton.jit
 def _signal(ptr):
     tl.debug_barrier()
     tl.atomic_add(ptr, 1, sem="release")
@@ -261,7 +277,7 @@ def _mega_kernel(tok_ptr, pos_ptr, emb_ptr,
                  H: tl.constexpr, I: tl.constexpr, NQKV: tl.constexpr,
                  NKV: tl.constexpr, GROUP: tl.constexpr, D: tl.constexpr, NSPLIT: tl.constexpr,
                  BM: tl.constexpr, BN: tl.constexpr, BK: tl.constexpr, BLOCK_N: tl.constexpr,
-                 DOT_F32: tl.constexpr):
+                 DOT_F32: tl.constexpr, PREFETCH: tl.constexpr):
     pid = tl.program_id(0)
     offs_m = tl.arange(0, BM)
     mmask = offs_m < M
@@ -288,6 +304,7 @@ def _mega_kernel(tok_ptr, pos_ptr, emb_ptr,
         # ---- P1: qkv
         r0 = (pid * NQKV) // G
         r1 = ((pid + 1) * NQKV) // G
+        _prefetch_rows(wq, r0, r1, H, 64, PREFETCH)
         if l == 0:
             _normed_rows(res_b, emb_ptr, tok, dl_ptr, ln1_ptr, res_a, wq, qkv_ptr,
                          M, H, NQKV, r0, r1, eps, pid == 0,
@@ -311,25 +328,29 @@ def _mega_kernel(tok_ptr, pos_ptr, emb_ptr,
         if n_done > 0:
             tl.atomic_add(c_att, n_done, sem="release")
         # ---- P3: o projection
-        _wait(c_att, (l + 1) * M * NKV)
         r0 = (pid * H) // G
         r1 = ((pid + 1) * H) // G
+        _prefetch_rows(wo, r0, r1, NQ * D, 32, PREFETCH)
+        _wait(c_att, (l + 1) * M * NKV)
         _plain_rows(att_ptr, wo, o_ptr, M, NQ * D, H, r0, r1,
                     BM, BN, BK, DOT_F32)
         _signal(c_o)
         # ---- P4: gate/up + swiglu (residual += o)
-        _wait(c_o, (l + 1) * G)
         r0 = (pid * I) // G
         r1 = ((pid + 1) * I) // G
+        _prefetch_rows(wgu, r0, r1, H, 16, PREFETCH)
+        _prefetch_rows(wgu + I * H, r0, r1, H, 16, PREFETCH)
+        _wait(c_o, (l + 1) * G)
         _normed_rows(res_a, emb_ptr, tok, o_ptr, ln2_ptr + l * H, res_b,
                      wgu, act_ptr,
                      M, H, I, r0, r1, eps, pid == 0,
                      False, True, True, BM, BN, BK, DOT_F32)
         _signal(c_gu)
         # ---- P5: down projection
-        _wait(c_gu, (l + 1) * G)
         r0 = (pid * H) // G
         r1 = ((pid + 1) * H) // G
+        _prefetch_rows(wd, r0, r1, I, 8, PREFETCH)
+        _wait(c_gu, (l + 1) * G)
         _plain_rows(act_ptr, wd, dl_ptr, M, I, H, r0, r1,
                     BM, BN, BK, DOT_F32)
         _signal(c_dn)
@@ -403,7 +424,8 @@ def _mega_kernel(tok_ptr, pos_ptr, emb_ptr,
 class MegaDecode:
     """Buffers + launcher for the persistent decode step of one (B, capacity)."""
 
-    def __init__(self, eng, st, attn_ws, programs):
+    def __init__(self, eng, st, attn_ws, programs, prefetch=False):
+        self.prefetch = prefetch
         dev = eng.device
         B = st.batch
         self.B, self.G = B, programs
@@ -436,5 +458,5 @@ class MegaDecode:
             kc.stride(0), kc.stride(1), kc.stride(2),
             H=self.H, I=self.I, NQKV=self.nqkv, NKV=eng.nkv, GROUP=eng.nq // eng.nkv, D=eng.d,
             NSPLIT=ws.nsplit, BM=16, BN=32, BK=128, BLOCK_N=64, DOT_F32=_DOT_F32,
-            num_warps=8, num_stages=3,
+            PREFETCH=self.prefetch, num_warps=8, num_stages=3,
         )
