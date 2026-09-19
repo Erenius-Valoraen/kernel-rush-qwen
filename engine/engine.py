@@ -26,6 +26,7 @@ import torch
 import torch.nn.functional as F
 from transformers import AutoModelForCausalLM
 
+from kernels.fused_attn import FusedDecodeAttention
 from kernels.gemv import gemv, gemv_swiglu
 from kernels.ops import DecodeAttention, add_rmsnorm, qk_norm_rope_cache, silu_mul
 
@@ -36,6 +37,7 @@ SPEC_MARGIN = 0.95         # speculative must beat plain by 5% on warmup
 GEMV_MAX_M = 128           # Triton skinny GEMMs up to this many rows
 SPLIT_QKV, SPLIT_O, SPLIT_DOWN = 2, 4, 4
 CALIBRATION_BUDGET_S = 150.0
+FUSED_ATTN = os.environ.get("ENGINE_UNFUSED_ATTN") != "1"
 
 
 def _log(msg):
@@ -100,7 +102,8 @@ class _Runner:
         self.t = t
         self.use_gemv = use_gemv
         B = st.batch
-        self.attn = DecodeAttention(B, t, st.capacity, eng.nq, eng.nkv, eng.d, dev, eng.num_sms)
+        cls = FusedDecodeAttention if FUSED_ATTN else DecodeAttention
+        self.attn = cls(B, t, st.capacity, eng.nq, eng.nkv, eng.d, dev, eng.num_sms)
         self.pos = torch.zeros((B,), device=dev, dtype=torch.int32)
         if t == 1:
             self.tok = torch.zeros((B,), device=dev, dtype=torch.int64)
@@ -331,10 +334,7 @@ class Engine:
         n = len(self.layers)
         for li, L in enumerate(self.layers):
             qkv = F.linear(h, L["qkv"])
-            kc, vc = st.k_cache[li], st.v_cache[li]
-            q = qk_norm_rope_cache(qkv, L["qn"], L["kn"], self.cos, self.sin, kc, vc,
-                                   pos, t, 0, self.eps, nq, nkv, d)
-            a = attn(q, kc, vc, pos)
+            a = self._attend(qkv, L, st.k_cache[li], st.v_cache[li], pos, t, attn)
             o = F.linear(a, L["o"])
             h = add_rmsnorm(x, o, L["ln2"], self.eps)
             delta = F.linear(silu_mul(F.linear(h, L["gu"])), L["down"])
@@ -343,6 +343,13 @@ class Engine:
         logits = F.linear(h, self.lm_head)
         return torch.argmax(logits, dim=-1)
 
+    def _attend(self, qkv, L, kc, vc, pos, t, attn):
+        if FUSED_ATTN:
+            return attn(qkv, L["qn"], L["kn"], self.cos, self.sin, kc, vc, pos, self.eps)
+        q = qk_norm_rope_cache(qkv, L["qn"], L["kn"], self.cos, self.sin, kc, vc,
+                               pos, t, 0, self.eps, self.nq, self.nkv, self.d)
+        return attn(q, kc, vc, pos)
+
     def _forward_step_gemv(self, st, toks, pos, t, attn):
         nq, nkv, d = self.nq, self.nkv, self.d
         x = F.embedding(toks, self.embed)
@@ -350,10 +357,7 @@ class Engine:
         n = len(self.layers)
         for li, L in enumerate(self.layers):
             qkv = gemv(h, L["qkv"], SPLIT_QKV)
-            kc, vc = st.k_cache[li], st.v_cache[li]
-            q = qk_norm_rope_cache(qkv, L["qn"], L["kn"], self.cos, self.sin, kc, vc,
-                                   pos, t, 0, self.eps, nq, nkv, d)
-            a = attn(q, kc, vc, pos)
+            a = self._attend(qkv, L, st.k_cache[li], st.v_cache[li], pos, t, attn)
             h = add_rmsnorm(x, gemv(a, L["o"], SPLIT_O), L["ln2"], self.eps)
             delta = gemv(gemv_swiglu(h, L["gu"]), L["down"], SPLIT_DOWN)
             nw = self.layers[li + 1]["ln1"] if li + 1 < n else self.final_norm
