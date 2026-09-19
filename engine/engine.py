@@ -230,12 +230,6 @@ class Engine:
         self.host_buf = None
         self.rope_len = 0
         self._ensure_rope(8192)
-        if self.cuda:
-            import diag
-            with torch.inference_mode():
-                msg = diag.run(self)
-            _log("DIAG " + msg)
-            raise RuntimeError("DIAG " + msg)
 
     # ------------------------------------------------------------------ utils
 
