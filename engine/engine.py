@@ -1039,7 +1039,7 @@ class Engine:
                     modes.append((1, plan))
         if gemv_ok and B <= GEMV_MAX_M:
             modes += [(1, "fixed")]
-            if self.fp8_dec_layers and B >= 4:
+            if self.fp8_dec_layers and B >= 2:
                 modes += [(1, "fp8")]
             if self.pdl_ok and n >= 4 and not self._late()                     and self._mega_matches(st, ids, S, steps=8, plan="fixedpdl", ref="fixed"):
                 modes += [(1, "fixedpdl")]
