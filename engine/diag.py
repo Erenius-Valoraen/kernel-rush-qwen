@@ -124,11 +124,11 @@ def measure(eng, st, S, n):
 
 def sleeps(m, sample):
     """(pre-first-token ms, per-token ms) for sample index 1..5."""
-    A = m["step_us"] / 5
-    B = 2000 + m["gemv_us"] / 5
-    C = 4000 + m["attn_us"] / 5
+    A = m["step_us"] / 20
+    B = 500 + m["gemv_us"] / 20
+    C = 1000 + m["attn_us"] / 20
     pre = [A, A, B, C, C][min(max(sample, 1), 5) - 1]
-    per = 10 * m["plan_idx"] + min(m["norm_us"], 999) / 100
+    per = 2 * m["plan_idx"] + min(m["norm_us"], 999) / 500
     return pre, per
 
 
