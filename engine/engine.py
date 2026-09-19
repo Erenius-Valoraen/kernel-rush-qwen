@@ -20,6 +20,7 @@ timing both on the warmup prompt:
 """
 
 import os
+import re
 import sys
 import time
 
@@ -51,6 +52,8 @@ from kernels import pdl
 from kernels.mega import MegaDecode
 from kernels.mlp import PersistentMLP
 from kernels.prefill_mlp import gu_swiglu
+from kernels import fp8
+from kernels.fp8 import ActScale, linear_fp8, quantize_weight
 from kernels.fused_gemv import FusedLayerBuffers, gemv_fused, gemv_swiglu_fused
 from kernels.gemv import gemv, gemv_m1, gemv_m1_swiglu, gemv_rows, gemv_swiglu, gemv_tma
 from kernels.spec import accept as spec_accept, draft as spec_draft
@@ -71,6 +74,10 @@ CALIB_REPS = 4                # timed repetitions per decode mode (min taken)
 WARMUP_DEADLINE_S = 180.0     # since __init__ began; the platform allows 300
 FUSED_ATTN = os.environ.get("ENGINE_UNFUSED_ATTN") != "1"
 LAST_LAYER_TRIM = os.environ.get("ENGINE_NO_TRIM") != "1"
+# prefill GEMMs run in FP8 (organisers allow FP8 compute); decode stays bf16
+FP8_SITES = tuple(filter(None, re.split("[,:]", os.environ.get("ENGINE_FP8", "gu"))))
+FP8_SKIP = tuple(int(v) for v in re.split("[,:]", os.environ.get("ENGINE_FP8_SKIP", "0:0")))   # leading, trailing bf16 layers
+FP8_MIN_ROWS = int(os.environ.get("ENGINE_FP8_MIN_ROWS", "256"))
 DIAG = os.environ.get("ENGINE_DIAG", "0") == "1"      # telemetry-through-timing build
 
 
@@ -338,6 +345,18 @@ class Engine:
                 setattr(self, attr, stacked)
                 if self.cuda:
                     torch.cuda.empty_cache()
+        self.fp8_ok = False
+        self.fp8_act = {}        # (layer, site) -> static activation scale
+        if self.cuda and FP8_SITES and torch.cuda.get_device_capability(self.device) >= (8, 9):
+            try:
+                with torch.no_grad():
+                    for L in self.layers:
+                        for key in FP8_SITES:
+                            L[key + "8"] = quantize_weight(L[key])
+                fp8.pick_cast(_log)
+                self.fp8_ok = True
+            except Exception as e:  # pragma: no cover
+                _log(f"fp8 weights unavailable: {e!r}")
         self.mega_ok = (tied and (self.cuda or os.environ.get("ENGINE_TEST_MEGA") == "1")
                         and os.environ.get("ENGINE_NO_MEGA") != "1")
         if self.cuda:
@@ -455,7 +474,7 @@ class Engine:
             last = len(self.layers) - 1
             for li, L in enumerate(self.layers):
                 h = add_rmsnorm(x, delta, L["ln1"], self.eps)
-                qkv = F.linear(h, L["qkv"])
+                qkv = self._pf_linear(h, li, "qkv") if self._pf_fp8(h, "qkv", li) else F.linear(h, L["qkv"])
                 kc, vc = st.k_cache[li], st.v_cache[li]
                 q = qk_norm_rope_cache_prefill(qkv, L["qn"], L["kn"], self.cos, self.sin, kc, vc,
                                                S, b0, self.eps, nq, nkv, d)
@@ -471,15 +490,34 @@ class Engine:
                     dl = F.linear(silu_mul(F.linear(hl, L["gu"])), L["down"])
                 else:
                     a = self._prefill_attn2(q, kc, vc, S, b0, g)
-                    o = F.linear(a, L["o"])
+                    o = self._pf_linear(a, li, "o") if self._pf_fp8(a, "o", li) else F.linear(a, L["o"])
                     h = add_rmsnorm(x, o, L["ln2"], self.eps)
-                    delta = F.linear(self._prefill_gu(h, L["gu"]), L["down"])
+                    if self._pf_fp8(h, "gu", li):
+                        act = silu_mul(self._pf_linear(h, li, "gu"))
+                    else:
+                        act = self._prefill_gu(h, L["gu"])
+                    delta = self._pf_linear(act, li, "down") if self._pf_fp8(act, "down", li) else F.linear(act, L["down"])
             if not LAST_LAYER_TRIM:
                 xl = x.view(g, S, -1)[:, -1].contiguous()
                 dl = delta.view(g, S, -1)[:, -1].contiguous()
             h = add_rmsnorm(xl, dl, self.final_norm, self.eps)
             logits = F.linear(h, self.lm_head)
             st.first[b0:b0 + g] = torch.argmax(logits, dim=-1)
+
+    def _pf_fp8(self, x, key, li):
+        return (self.fp8_ok and key in FP8_SITES and x.shape[0] >= FP8_MIN_ROWS
+                and FP8_SKIP[0] <= li < self.n_layers - FP8_SKIP[1])
+
+    def _pf_linear(self, x, li, key):
+        """Prefill GEMM in FP8. The site's activation scale is measured on the
+        first eager pass and static afterwards (graph-safe, no sync)."""
+        L = self.layers[li]
+        a = self.fp8_act.get((li, key))
+        if a is None:
+            if torch.cuda.is_current_stream_capturing():
+                return F.linear(x, L[key])
+            a = self.fp8_act[(li, key)] = ActScale(x)
+        return linear_fp8(x, L[key + "8"], a)
 
     def _prefill_gu(self, h, w):
         """SwiGLU(h @ [Wg; Wu]^T) for prefill: cuBLAS + separate SiLU kernel, or

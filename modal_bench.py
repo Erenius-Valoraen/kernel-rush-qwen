@@ -75,7 +75,7 @@ def bench(shapes: str, check: int, env: str, samples: int):
         list(eng.generate(prompts(B, S), N))
         torch.cuda.synchronize()
         print(f"[{shp}] load+warmup {time.perf_counter() - t0:.1f}s  mode={eng.state.mode}")
-        tot, ttft, outs, ins = [], [], None, None
+        tot, ttft, outs, ins = [], [], [], []
         for _ in range(samples):
             ids = prompts(B, S)
             t0 = time.perf_counter()
@@ -86,7 +86,7 @@ def bench(shapes: str, check: int, env: str, samples: int):
                     first = time.perf_counter() - t0
                 steps.append(s)
             dt = time.perf_counter() - t0
-            tot.append(dt); ttft.append(first); outs, ins = steps, ids
+            tot.append(dt); ttft.append(first); outs.append(steps); ins.append(ids)
         tot.sort(); ttft.sort()
         med, f = tot[len(tot) // 2], ttft[len(ttft) // 2]
         print(f"[{shp}] total {med * 1e3:.1f}ms  ttft {f * 1e3:.1f}ms  tpot {(med - f) / max(1, N - 1) * 1e3:.3f}ms  "
@@ -99,17 +99,20 @@ def bench(shapes: str, check: int, env: str, samples: int):
         from transformers import AutoModelForCausalLM
         ref = AutoModelForCausalLM.from_pretrained(path, torch_dtype=torch.bfloat16,
                                                    attn_implementation="sdpa").eval().cuda()
-        for shp, (ins, outs) in results.items():
-            S = len(ins[0])
-            out = torch.tensor(outs).T
-            full = torch.cat([torch.tensor(ins), out], 1).cuda()
-            worst = 0.0
-            with torch.inference_mode():
-                for b in range(0, full.shape[0], 4):
-                    lg = ref(input_ids=full[b:b + 4]).logits[:, S - 1:-1].float()
-                    ch = lg.gather(-1, out[b:b + 4].cuda().unsqueeze(-1)).squeeze(-1)
-                    worst = max(worst, (lg.max(-1).values - ch).max().item())
-            print(f"[{shp}] correctness: worst gap to reference argmax = {worst:.3f} (limit 2.0)")
+        for shp, (all_ins, all_outs) in results.items():
+            worst, over1, npos = 0.0, 0, 0
+            for ins, outs in zip(all_ins, all_outs):
+                S = len(ins[0])
+                out = torch.tensor(outs).T
+                full = torch.cat([torch.tensor(ins), out], 1).cuda()
+                with torch.inference_mode():
+                    for b in range(0, full.shape[0], 4):
+                        lg = ref(input_ids=full[b:b + 4]).logits[:, S - 1:-1].float()
+                        ch = lg.gather(-1, out[b:b + 4].cuda().unsqueeze(-1)).squeeze(-1)
+                        gap = lg.max(-1).values - ch
+                        worst = max(worst, gap.max().item())
+                        over1 += int((gap > 1.0).sum()); npos += gap.numel()
+            print(f"[{shp}] correctness: worst gap = {worst:.3f} (limit 2.0), gaps>1.0: {over1} of {npos} positions")
 
 
 @app.local_entrypoint()
