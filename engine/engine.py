@@ -13,9 +13,10 @@ timing both on the warmup prompt:
   * plain: one token per step, graph advances its own positions on device and
     steps are replayed back-to-back while the host streams tokens out;
   * speculative: each sequence proposes T-1 draft tokens by n-gram lookup in
-    its own prompt + output, one graph verifies all T positions, and the
+    its own prompt + output, the model verifies all T positions, and the
     longest prefix matching the model's own argmax is accepted plus the
-    model's next token. Exact greedy by construction.
+    model's next token. Exact greedy by construction. Drafting, verification
+    and acceptance all run on device inside one CUDA graph.
 """
 
 import os
@@ -27,16 +28,17 @@ import torch.nn.functional as F
 from transformers import AutoModelForCausalLM
 
 from kernels.fused_attn import FusedDecodeAttention
-from kernels.gemv import gemv, gemv_swiglu
+from kernels.gemv import gemv, gemv_m1, gemv_m1_swiglu, gemv_swiglu
+from kernels.spec import accept as spec_accept, draft as spec_draft
 from kernels.ops import DecodeAttention, add_rmsnorm, qk_norm_rope_cache, silu_mul
 
 PREFILL_TOKENS = 8192      # rows per prefill chunk (whole sequences per chunk)
 LOOKAHEAD = 8              # plain mode: steps enqueued ahead of the one yielded
-MAX_NGRAM = 4
 SPEC_MARGIN = 0.95         # speculative must beat plain by 5% on warmup
 GEMV_MAX_M = 128           # Triton skinny GEMMs up to this many rows
 SPLIT_QKV, SPLIT_O, SPLIT_DOWN = 2, 4, 4
 CALIBRATION_BUDGET_S = 150.0
+WARMUP_DEADLINE_S = 200.0     # since __init__ began; the platform allows 300
 FUSED_ATTN = os.environ.get("ENGINE_UNFUSED_ATTN") != "1"
 
 
@@ -49,49 +51,47 @@ def _repeat_kv(x, n_rep):
     return x[:, :, None, :, :].expand(b, h, n_rep, s, d).reshape(b, h * n_rep, s, d)
 
 
+def _gemm_candidates(name, M):
+    """Implementations of one decode matmul; each returns bf16 [M, N] or fp32
+    split-K partials [S, M, N] (lm head and gate/up: bf16 only)."""
+    if name == "gu":
+        c = ["cublas", "tr"]
+        return c + ["m1"] if M == 1 else c
+    if name == "lm":
+        c = ["cublas", "tr1"]
+        return c + ["m1_1"] if M == 1 else c
+    splits = {"qkv": (1, 2, 4), "o": (1, 2, 4, 8), "down": (1, 2, 4, 8)}[name]
+    c = ["cublas"] + [f"tr{s}" for s in splits]
+    if M == 1:
+        c += [f"m1_{s}" for s in splits]
+    return c
+
+
+def _gemm_run(name, cand, x, w):
+    if name == "gu":
+        if cand == "cublas":
+            return silu_mul(F.linear(x, w))
+        return gemv_m1_swiglu(x, w) if cand == "m1" else gemv_swiglu(x, w)
+    if cand == "cublas":
+        return F.linear(x, w)
+    if cand.startswith("m1_"):
+        return gemv_m1(x, w, int(cand[3:]))
+    return gemv(x, w, int(cand[2:]))
+
+
 def _spec_candidates(batch):
     env = os.environ.get("ENGINE_SPEC_T")
     if env is not None:
         return [int(t) for t in env.split(",")]
-    if batch <= 4:
+    if batch == 1:
         return [1, 4, 8]
+    if batch <= 4:
+        return [1, 4]
     if batch <= 16:
-        return [1, 3, 5]
-    if batch <= 32:
         return [1, 3]
+    if batch <= 32:
+        return [1, 2]
     return [1]
-
-
-class _Drafter:
-    """Most-recent-occurrence n-gram lookup over one sequence's tokens."""
-
-    def __init__(self, tokens):
-        self.toks = []
-        self.tables = [None] + [{} for _ in range(MAX_NGRAM)]
-        self.extend(tokens)
-
-    def extend(self, new):
-        toks, tables = self.toks, self.tables
-        for t in new:
-            # n-grams ending at the current last token now have a continuation
-            i = len(toks) - 1
-            for n in range(1, MAX_NGRAM + 1):
-                if i - n + 1 < 0:
-                    break
-                tables[n][tuple(toks[i - n + 1:i + 1])] = i + 1
-            toks.append(t)
-
-    def draft(self, k):
-        toks = self.toks
-        L = len(toks)
-        for n in range(min(MAX_NGRAM, L), 0, -1):
-            p = self.tables[n].get(tuple(toks[L - n:]))
-            if p is not None:
-                out = toks[p:p + k]
-                if len(out) < k:
-                    out = out + [out[-1] if out else toks[-1]] * (k - len(out))
-                return out
-        return [toks[-1]] * k
 
 
 class _Runner:
@@ -108,9 +108,14 @@ class _Runner:
         if t == 1:
             self.tok = torch.zeros((B,), device=dev, dtype=torch.int64)
         else:
-            self.inbuf = torch.zeros((B, t + 1), device=dev, dtype=torch.int64)
+            self.hist = torch.zeros((B, st.capacity), device=dev, dtype=torch.int32)
+            self.hlen = torch.ones((B,), device=dev, dtype=torch.int32)
+            self.lim = torch.ones((B,), device=dev, dtype=torch.int32)
+            self.inp = torch.zeros((B, t), device=dev, dtype=torch.int64)
             self.out = torch.zeros((B, t), device=dev, dtype=torch.int64)
         self.graph = None
+        if use_gemv:
+            eng._tune_gemms(B * t)
 
     def step(self, eng, st):
         if self.t == 1:
@@ -118,10 +123,11 @@ class _Runner:
             self.tok.copy_(nxt)
             self.pos.add_(1)
         else:
-            self.pos.copy_(self.inbuf[:, self.t])
-            toks = self.inbuf[:, :self.t].reshape(-1)
-            nxt = eng._forward_step(st, toks, self.pos, self.t, self.attn, self.use_gemv)
+            spec_draft(self.hist, self.hlen, self.inp, self.pos, self.t)
+            nxt = eng._forward_step(st, self.inp.view(-1), self.pos, self.t, self.attn,
+                                    self.use_gemv)
             self.out.copy_(nxt.view(st.batch, self.t))
+            spec_accept(self.hist, self.hlen, self.lim, self.inp, self.out, self.t)
 
     def run(self, eng, st):
         if self.graph is not None:
@@ -136,8 +142,8 @@ class _Runner:
             # Autotuning happens here, so run at the longest context.
             for _ in range(2):
                 if self.t > 1:
-                    self.inbuf.zero_()
-                    self.inbuf[:, self.t] = st.capacity - self.t
+                    self.hlen.fill_(st.capacity - self.t + 1)
+                    self.lim.copy_(self.hlen)
                 else:
                     self.pos.fill_(st.capacity - 2)
                 self.step(eng, st)
@@ -183,6 +189,7 @@ class _State:
 
 class Engine:
     def __init__(self, model_path: str) -> None:
+        self.t_init = time.perf_counter()
         torch.backends.cuda.matmul.allow_tf32 = False
         torch.backends.cudnn.allow_tf32 = False
         self.device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
@@ -228,6 +235,7 @@ class Engine:
 
         self.state = None
         self.host_buf = None
+        self.gemm_plan = {}      # (name, M) -> implementation
         self.rope_len = 0
         self._ensure_rope(8192)
 
@@ -257,6 +265,9 @@ class Engine:
         capacity = -(-needed // 128) * 128
         self.state = _State(self, batch, capacity)
         return self.state
+
+    def _late(self):
+        return time.perf_counter() - self.t_init > WARMUP_DEADLINE_S
 
     def _sync(self):
         if self.cuda:
@@ -350,19 +361,75 @@ class Engine:
                                pos, t, 0, self.eps, self.nq, self.nkv, self.d)
         return attn(q, kc, vc, pos)
 
+    @torch.inference_mode()
+    def _tune_gemms(self, M):
+        """Time every implementation of each decode matmul at M rows, cycling
+        through all layers' weights (so nothing is served from L2), and keep
+        the fastest. Runs once per M during the untimed warmup."""
+        if ("qkv", M) in self.gemm_plan:
+            return
+        dev = self.device
+        H = self.embed.shape[1]
+        report = []
+        for name in ("qkv", "o", "gu", "down", "lm"):
+            if name == "lm":
+                ws = [self.lm_head] * 4
+            else:
+                key = {"qkv": "qkv", "o": "o", "gu": "gu", "down": "down"}[name]
+                ws = [L[key] for L in self.layers]
+            K = ws[0].shape[1]
+            if name == "down":
+                K = ws[0].shape[1]
+            x = torch.randn((M, K), device=dev, dtype=torch.bfloat16) * 0.1
+            if not self.cuda:
+                ws = ws[:1]
+            best, best_t = "cublas", None
+            times = []
+            for cand in _gemm_candidates(name, M):
+                if cand != "cublas" and self._late():
+                    continue
+                try:
+                    _gemm_run(name, cand, x, ws[0])          # compile + autotune
+                    self._sync()
+                    t_min = None
+                    for _ in range(3 if self.cuda else 1):
+                        if self.cuda:
+                            e0 = torch.cuda.Event(enable_timing=True)
+                            e1 = torch.cuda.Event(enable_timing=True)
+                            e0.record()
+                            for w in ws:
+                                _gemm_run(name, cand, x, w)
+                            e1.record()
+                            e1.synchronize()
+                            dt = e0.elapsed_time(e1) / len(ws)
+                        else:
+                            dt = 1.0 if cand != os.environ.get("ENGINE_TEST_GEMM", "cublas") else 0.5
+                        t_min = dt if t_min is None else min(t_min, dt)
+                    times.append(f"{cand}={t_min * 1e3:.0f}")
+                    if best_t is None or t_min < best_t:
+                        best, best_t = cand, t_min
+                except Exception as e:  # pragma: no cover
+                    times.append(f"{cand}=ERR")
+            self.gemm_plan[(name, M)] = best
+            report.append(f"{name}:{best} ({' '.join(times)}us)")
+        _log(f"gemm plan M={M}: " + "; ".join(report))
+
+    def _gemm(self, name, x, w):
+        return _gemm_run(name, self.gemm_plan[(name, x.shape[0])], x, w)
+
     def _forward_step_gemv(self, st, toks, pos, t, attn):
         nq, nkv, d = self.nq, self.nkv, self.d
         x = F.embedding(toks, self.embed)
         h = add_rmsnorm(x, None, self.layers[0]["ln1"], self.eps)
         n = len(self.layers)
         for li, L in enumerate(self.layers):
-            qkv = gemv(h, L["qkv"], SPLIT_QKV)
+            qkv = self._gemm("qkv", h, L["qkv"])
             a = self._attend(qkv, L, st.k_cache[li], st.v_cache[li], pos, t, attn)
-            h = add_rmsnorm(x, gemv(a, L["o"], SPLIT_O), L["ln2"], self.eps)
-            delta = gemv(gemv_swiglu(h, L["gu"]), L["down"], SPLIT_DOWN)
+            h = add_rmsnorm(x, self._gemm("o", a, L["o"]), L["ln2"], self.eps)
+            delta = self._gemm("down", self._gemm("gu", h, L["gu"]), L["down"])
             nw = self.layers[li + 1]["ln1"] if li + 1 < n else self.final_norm
             h = add_rmsnorm(x, delta, nw, self.eps)
-        logits = gemv(h, self.lm_head)
+        logits = self._gemm("lm", h, self.lm_head)
         return torch.argmax(logits, dim=-1)
 
     # ------------------------------------------------------------ decode loops
@@ -403,73 +470,80 @@ class Engine:
             yield host[i].tolist()
 
     def _spec(self, st, ids, input_ids, S, n, t, use_gemv, stats=None):
+        """Speculative decoding with drafting/acceptance on device: steps are
+        replayed back-to-back; the host only streams finished tokens out."""
         r = st.runner(self, t, use_gemv)
         B = st.batch
-        k = t - 1
         self._prefill(ids, st)
-        first_host = st.first.to("cpu", non_blocking=True) if self.cuda else st.first
-        ev = None
-        if self.cuda:
-            ev = torch.cuda.Event()
-            ev.record()
-        drafters = [_Drafter(p) for p in input_ids]     # overlaps the prefill
-        if ev is not None:
-            ev.synchronize()
-        first = first_host.tolist()
-        yield first
-        if n == 1:
+        r.hist[:, :S].copy_(ids)
+        r.hist[:, S].copy_(st.first)
+        r.hlen.fill_(S + 1)
+        r.lim.fill_(S + n)
+        if not self.cuda:
+            yield st.first.tolist()
+            emitted, steps = 1, 0
+            while emitted < n:
+                r.run(self, st)
+                steps += 1
+                hl = r.hlen.tolist()
+                toks = r.hist[:, S:S + n].tolist()
+                ready = min(hl) - S
+                while emitted < ready:
+                    yield [toks[b][emitted] for b in range(B)]
+                    emitted += 1
+            if stats is not None:
+                stats["steps"], stats["accepted"] = steps, B * (n - 1 - steps)
             return
-        outs = [[tk] for tk in first]
-        for dr, tk in zip(drafters, first):
-            dr.extend([tk])
-        pos = [S] * B
-        emitted = 1
-        steps = accepted = 0
-        inbuf_host = torch.empty((B, t + 1), dtype=torch.int64, pin_memory=self.cuda)
-        out_host = torch.empty((B, t), dtype=torch.int64, pin_memory=self.cuda)
-        inb = inbuf_host.numpy()
-        while emitted < n:
-            drafts = []
-            for b in range(B):
-                if len(outs[b]) >= n:        # finished: harmless work at position 0
-                    dr = [0] * k
-                    inb[b, 0] = 0
-                    inb[b, t] = 0
-                else:
-                    dr = drafters[b].draft(k)
-                    inb[b, 0] = outs[b][-1]
-                    inb[b, t] = pos[b]
-                inb[b, 1:t] = dr
-                drafts.append(dr)
-            r.inbuf.copy_(inbuf_host, non_blocking=True)
+
+        nslot = LOOKAHEAD + 2
+        key = (nslot, B, n)
+        if getattr(self, "_spec_bufs_key", None) != key:
+            self._spec_bufs_key = key
+            self._spec_hl = torch.empty((nslot, B), dtype=torch.int32, pin_memory=True)
+            self._spec_tok = torch.empty((nslot, B, n), dtype=torch.int32, pin_memory=True)
+            self._spec_first = torch.empty((B,), dtype=torch.int64, pin_memory=True)
+        hl_h, tok_h = self._spec_hl, self._spec_tok
+        stream = torch.cuda.current_stream()
+        self._spec_first.copy_(st.first, non_blocking=True)
+        ev0 = torch.cuda.Event()
+        ev0.record(stream)
+        events = {}
+
+        def launch(i):
             r.run(self, st)
-            out_host.copy_(r.out, non_blocking=True)
-            if self.cuda:
-                e = torch.cuda.Event()
-                e.record()
-                e.synchronize()
-            res = out_host.tolist()
-            steps += 1
-            for b in range(B):
-                if len(outs[b]) >= n:
-                    continue
-                row, dr = res[b], drafts[b]
-                a = 0
-                while a < k and dr[a] == row[a]:
-                    a += 1
-                new = row[:a + 1]
-                outs[b].extend(new)
-                drafters[b].extend(new)
-                pos[b] += a + 1
-                accepted += a
-            ready = min(min(len(o) for o in outs), n)
-            while emitted < ready:
-                yield [o[emitted] for o in outs]
-                emitted += 1
+            slot = i % nslot
+            hl_h[slot].copy_(r.hlen, non_blocking=True)
+            tok_h[slot].copy_(r.hist[:, S:S + n], non_blocking=True)
+            ev = torch.cuda.Event()
+            ev.record(stream)
+            events[i] = ev
+
+        # Every step yields >= 1 token per unfinished sequence, so never queue
+        # more steps than could still be needed.
+        launched, done, min_len = 0, 0, 1
+        while launched < min(LOOKAHEAD, n - 1):
+            launch(launched)
+            launched += 1
+        ev0.synchronize()
+        yield self._spec_first.tolist()
+        emitted = 1
+        while emitted < n:
+            events.pop(done).synchronize()
+            slot = done % nslot
+            done += 1
+            hl = hl_h[slot].tolist()
+            min_len = min(hl) - S
+            if min_len > emitted:
+                toks = tok_h[slot][:, emitted:min_len].tolist()
+                for c in range(min_len - emitted):
+                    yield [row[c] for row in toks]
+                emitted = min_len
+            while launched < done + LOOKAHEAD and launched - done < n - min_len:
+                launch(launched)
+                launched += 1
         if stats is not None:
-            stats["steps"] = steps
-            stats["accepted"] = accepted
-            stats["outs"] = outs
+            stats["steps"] = done
+            stats["accepted"] = B * (n - 1) - B * done
 
     # ---------------------------------------------------------------- choose
 
@@ -488,7 +562,8 @@ class Engine:
             modes = [(t, True) for t, _ in modes if B * t <= GEMV_MAX_M]
         best, best_time, report = (1, False), None, []
         for t, g in modes:
-            if time.perf_counter() - start > CALIBRATION_BUDGET_S:
+            if (t, g) != (1, False) and (time.perf_counter() - start > CALIBRATION_BUDGET_S
+                                         or self._late()):
                 report.append(f"T={t} gemv={g}: skipped (budget)")
                 continue
             try:

@@ -36,7 +36,8 @@ def _prune(configs, named_args, **kwargs):
 
 
 @triton.autotune(configs=_CONFIGS, key=["M", "N", "K", "K_SPLIT"],
-                 prune_configs_by={"early_config_prune": _prune})
+                 prune_configs_by={"early_config_prune": _prune},
+                 warmup=5, rep=20)
 @triton.jit
 def _gemv_kernel(x_ptr, w_ptr, out_ptr, M, N, K, K_SPLIT,
                  BM: tl.constexpr, BN: tl.constexpr, BK: tl.constexpr,
@@ -67,7 +68,8 @@ def _gemv_kernel(x_ptr, w_ptr, out_ptr, M, N, K, K_SPLIT,
 
 
 @triton.autotune(configs=_CONFIGS, key=["M", "I", "K"],
-                 prune_configs_by={"early_config_prune": _prune})
+                 prune_configs_by={"early_config_prune": _prune},
+                 warmup=5, rep=20)
 @triton.jit
 def _gemv_swiglu_kernel(x_ptr, w_ptr, out_ptr, M, I, K,
                         BM: tl.constexpr, BN: tl.constexpr, BK: tl.constexpr,
@@ -129,4 +131,92 @@ def gemv_swiglu(x, w_gu):
     out = torch.empty((M, I), device=x.device, dtype=torch.bfloat16)
     grid = lambda meta: (I // meta["BN"],)
     _gemv_swiglu_kernel[grid](x, w_gu, out, M, I, K, BM=_bm(M), DOT_F32=_DOT_F32)
+    return out
+
+
+# ---------------------------------------------------------------------------
+# M == 1 variants on CUDA cores: elementwise FMA into a [BN, BK] fp32 tile,
+# one reduction at the end. No shared-memory staging, wide vector loads.
+# ---------------------------------------------------------------------------
+
+if os.environ.get("TRITON_INTERPRET") == "1":
+    _M1_CONFIGS = [triton.Config({"BN": 16, "BK": 64}, num_warps=4, num_stages=1)]
+else:
+    _M1_CONFIGS = [
+        triton.Config({"BN": bn, "BK": bk}, num_warps=w, num_stages=st)
+        for bn, bk, w, st in [
+            (8, 512, 4, 1), (16, 256, 4, 1), (16, 512, 8, 1), (32, 256, 8, 1),
+            (4, 1024, 4, 1), (8, 512, 4, 3),
+        ]
+    ]
+
+
+@triton.autotune(configs=_M1_CONFIGS, key=["N", "K", "K_SPLIT"],
+                 prune_configs_by={"early_config_prune": _prune},
+                 warmup=5, rep=20)
+@triton.jit
+def _gemv_m1_kernel(x_ptr, w_ptr, out_ptr, N, K, K_SPLIT,
+                    BN: tl.constexpr, BK: tl.constexpr, PARTIAL: tl.constexpr):
+    pid_n = tl.program_id(0)
+    pid_k = tl.program_id(1)
+    offs_n = pid_n * BN + tl.arange(0, BN)
+    acc = tl.zeros([BN, BK], tl.float32)
+    k0 = pid_k * K_SPLIT
+    w_base = w_ptr + offs_n[:, None].to(tl.int64) * K
+    for kk in range(0, K_SPLIT, BK):
+        offs_k = k0 + kk + tl.arange(0, BK)
+        x = tl.load(x_ptr + offs_k).to(tl.float32)
+        w = tl.load(w_base + offs_k[None, :]).to(tl.float32)
+        acc += w * x[None, :]
+    res = tl.sum(acc, axis=1)
+    if PARTIAL:
+        tl.store(out_ptr + pid_k * N + offs_n, res)
+    else:
+        tl.store(out_ptr + offs_n, res.to(tl.bfloat16))
+
+
+@triton.autotune(configs=_M1_CONFIGS, key=["I", "K"],
+                 prune_configs_by={"early_config_prune": _prune},
+                 warmup=5, rep=20)
+@triton.jit
+def _gemv_m1_swiglu_kernel(x_ptr, w_ptr, out_ptr, I, K,
+                           BN: tl.constexpr, BK: tl.constexpr):
+    pid_n = tl.program_id(0)
+    offs_n = pid_n * BN + tl.arange(0, BN)
+    acc_g = tl.zeros([BN, BK], tl.float32)
+    acc_u = tl.zeros([BN, BK], tl.float32)
+    g_base = w_ptr + offs_n[:, None].to(tl.int64) * K
+    u_base = w_ptr + (I + offs_n[:, None]).to(tl.int64) * K
+    for kk in range(0, K, BK):
+        offs_k = kk + tl.arange(0, BK)
+        x = tl.load(x_ptr + offs_k).to(tl.float32)[None, :]
+        acc_g += tl.load(g_base + offs_k[None, :]).to(tl.float32) * x
+        acc_u += tl.load(u_base + offs_k[None, :]).to(tl.float32) * x
+    g = tl.sum(acc_g, axis=1).to(tl.bfloat16).to(tl.float32)
+    u = tl.sum(acc_u, axis=1).to(tl.bfloat16).to(tl.float32)
+    s = (g / (1.0 + tl.exp(-g))).to(tl.bfloat16).to(tl.float32)
+    tl.store(out_ptr + offs_n, (s * u).to(tl.bfloat16))
+
+
+def gemv_m1(x, w, split=1):
+    """Same contract as gemv() for a single row."""
+    M, K = x.shape
+    assert M == 1 and K % split == 0
+    N = w.shape[0]
+    if split == 1:
+        out = torch.empty((1, N), device=x.device, dtype=torch.bfloat16)
+    else:
+        out = torch.empty((split, 1, N), device=x.device, dtype=torch.float32)
+    grid = lambda meta: (N // meta["BN"], split)
+    _gemv_m1_kernel[grid](x, w, out, N, K, K // split, PARTIAL=split > 1)
+    return out
+
+
+def gemv_m1_swiglu(x, w_gu):
+    M, K = x.shape
+    assert M == 1
+    I = w_gu.shape[0] // 2
+    out = torch.empty((1, I), device=x.device, dtype=torch.bfloat16)
+    grid = lambda meta: (I // meta["BN"],)
+    _gemv_m1_swiglu_kernel[grid](x, w_gu, out, I, K)
     return out
