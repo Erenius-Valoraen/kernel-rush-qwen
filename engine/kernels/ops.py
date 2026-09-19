@@ -322,3 +322,69 @@ class DecodeAttention:
             SPAD=max(2, triton.next_power_of_2(self.nsplit)), num_warps=2,
         )
         return out
+
+
+# ---------------------------------------------------------------------------
+# Prefill variant of the Q/K norm + RoPE + cache write: one program per
+# (token, group of HB heads) instead of per (token, head) - 8x fewer, fatter
+# programs. Same arithmetic and rounding points as _qk_norm_rope_kernel.
+# ---------------------------------------------------------------------------
+
+
+@triton.jit
+def _qk_norm_rope_prefill_kernel(qkv_ptr, qw_ptr, kw_ptr, cos_ptr, sin_ptr, q_out_ptr,
+                                 kc_ptr, vc_ptr, S, b0, stride_cb, stride_ch, eps,
+                                 NQ: tl.constexpr, NKV: tl.constexpr, D: tl.constexpr,
+                                 HB: tl.constexpr):
+    row = tl.program_id(0)
+    grp = tl.program_id(1)
+    HALF: tl.constexpr = D // 2
+    b = b0 + row // S
+    pos = row % S
+    row64 = row.to(tl.int64)
+    heads = grp * HB + tl.arange(0, HB)                      # [HB] absolute head ids
+    offs = tl.arange(0, HALF)
+    src = qkv_ptr + row64 * ((NQ + 2 * NKV) * D) + heads[:, None] * D + offs[None, :]
+    cache_row = b.to(tl.int64) * stride_cb + pos.to(tl.int64) * D
+    if grp * HB < NQ + NKV:
+        x1 = tl.load(src).to(tl.float32)
+        x2 = tl.load(src + HALF).to(tl.float32)
+        var = (tl.sum(x1 * x1, axis=1) + tl.sum(x2 * x2, axis=1)) / D
+        rstd = tl.math.rsqrt(var + eps)[:, None]
+        if grp * HB < NQ:
+            w_ptr = qw_ptr
+        else:
+            w_ptr = kw_ptr
+        w1 = tl.load(w_ptr + offs).to(tl.float32)[None, :]
+        w2 = tl.load(w_ptr + HALF + offs).to(tl.float32)[None, :]
+        n1 = ((x1 * rstd).to(tl.bfloat16).to(tl.float32) * w1).to(tl.bfloat16).to(tl.float32)
+        n2 = ((x2 * rstd).to(tl.bfloat16).to(tl.float32) * w2).to(tl.bfloat16).to(tl.float32)
+        c1 = tl.load(cos_ptr + pos * D + offs).to(tl.float32)[None, :]
+        c2 = tl.load(cos_ptr + pos * D + HALF + offs).to(tl.float32)[None, :]
+        s1 = tl.load(sin_ptr + pos * D + offs).to(tl.float32)[None, :]
+        s2 = tl.load(sin_ptr + pos * D + HALF + offs).to(tl.float32)[None, :]
+        o1 = ((n1 * c1).to(tl.bfloat16).to(tl.float32) + (-n2 * s1).to(tl.bfloat16).to(tl.float32)).to(tl.bfloat16)
+        o2 = ((n2 * c2).to(tl.bfloat16).to(tl.float32) + (n1 * s2).to(tl.bfloat16).to(tl.float32)).to(tl.bfloat16)
+        if grp * HB < NQ:
+            dst = q_out_ptr + row64 * (NQ * D) + heads[:, None] * D + offs[None, :]
+        else:
+            dst = kc_ptr + cache_row + (heads - NQ)[:, None] * stride_ch + offs[None, :]
+        tl.store(dst, o1)
+        tl.store(dst + HALF, o2)
+    else:
+        dst = vc_ptr + cache_row + (heads - NQ - NKV)[:, None] * stride_ch + offs[None, :]
+        tl.store(dst, tl.load(src))
+        tl.store(dst + HALF, tl.load(src + HALF))
+
+
+def qk_norm_rope_cache_prefill(qkv, q_w, k_w, cos, sin, k_cache, v_cache, S, b0, eps, nq, nkv, d):
+    """bf16 qkv [M, W], positions 0..S-1 per sequence. Requires nkv | nq."""
+    M = qkv.shape[0]
+    hb = nkv
+    q_out = torch.empty((M, nq * d), device=qkv.device, dtype=torch.bfloat16)
+    _qk_norm_rope_prefill_kernel[(M, (nq + 2 * nkv) // hb)](
+        qkv, q_w, k_w, cos, sin, q_out, k_cache, v_cache, S, b0,
+        k_cache.stride(0), k_cache.stride(1), eps,
+        NQ=nq, NKV=nkv, D=d, HB=hb, num_warps=4,
+    )
+    return q_out

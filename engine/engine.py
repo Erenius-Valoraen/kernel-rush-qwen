@@ -45,6 +45,7 @@ import torch
 import torch.nn.functional as F
 from transformers import AutoModelForCausalLM
 
+from kernels.flash_prefill import flash_prefill
 from kernels.fused_attn import FusedDecodeAttention
 from kernels import pdl
 from kernels.mega import MegaDecode
@@ -53,7 +54,8 @@ from kernels.prefill_mlp import gu_swiglu
 from kernels.fused_gemv import FusedLayerBuffers, gemv_fused, gemv_swiglu_fused
 from kernels.gemv import gemv, gemv_m1, gemv_m1_swiglu, gemv_rows, gemv_swiglu, gemv_tma
 from kernels.spec import accept as spec_accept, draft as spec_draft
-from kernels.ops import DecodeAttention, add_rmsnorm, qk_norm_rope_cache, silu_mul
+from kernels.ops import (DecodeAttention, add_rmsnorm, qk_norm_rope_cache,
+                         qk_norm_rope_cache_prefill, silu_mul)
 
 PREFILL_TOKENS = 8192      # rows per prefill chunk (whole sequences per chunk)
 LOOKAHEAD = 8              # plain mode: steps enqueued ahead of the one yielded
@@ -66,6 +68,7 @@ CALIBRATION_BUDGET_S = 150.0
 CALIB_REPS = 4                # timed repetitions per decode mode (min taken)
 WARMUP_DEADLINE_S = 180.0     # since __init__ began; the platform allows 300
 FUSED_ATTN = os.environ.get("ENGINE_UNFUSED_ATTN") != "1"
+LAST_LAYER_TRIM = os.environ.get("ENGINE_NO_TRIM") != "1"
 DIAG = os.environ.get("ENGINE_DIAG", "0") == "1"      # telemetry-through-timing build
 
 
@@ -344,6 +347,7 @@ class Engine:
         self.pmlp = {}           # M -> PersistentMLP when it won tuning
         self.fused_bufs = {}     # M -> FusedLayerBuffers
         self.attn_choice = {}    # prefill q shape -> SDPA variant
+        self.attn2_choice = {}   # (g, S) -> sdpa | triton flash prefill
         self.gu_choice = {}      # prefill h shape -> gate/up implementation
         self.rope_len = 0
         self._ensure_rope(8192)
@@ -446,20 +450,31 @@ class Engine:
             g = min(per, B - b0)
             x = F.embedding(ids[b0:b0 + g].reshape(-1), self.embed)
             delta = None
+            last = len(self.layers) - 1
             for li, L in enumerate(self.layers):
                 h = add_rmsnorm(x, delta, L["ln1"], self.eps)
                 qkv = F.linear(h, L["qkv"])
                 kc, vc = st.k_cache[li], st.v_cache[li]
-                q = qk_norm_rope_cache(qkv, L["qn"], L["kn"], self.cos, self.sin, kc, vc,
-                                       st.zero_pos, S, b0, self.eps, nq, nkv, d)
-                q = q.view(g, S, nq, d).transpose(1, 2)
-                a = self._prefill_attn(q, kc[b0:b0 + g, :, :S], vc[b0:b0 + g, :, :S])
-                a = a.transpose(1, 2).reshape(g * S, nq * d)
-                o = F.linear(a, L["o"])
-                h = add_rmsnorm(x, o, L["ln2"], self.eps)
-                delta = F.linear(self._prefill_gu(h, L["gu"]), L["down"])
-            xl = x.view(g, S, -1)[:, -1].contiguous()
-            dl = delta.view(g, S, -1)[:, -1].contiguous()
+                q = qk_norm_rope_cache_prefill(qkv, L["qn"], L["kn"], self.cos, self.sin, kc, vc,
+                                               S, b0, self.eps, nq, nkv, d)
+                if li == last and LAST_LAYER_TRIM:
+                    # Only each sequence's final position feeds the logits: one
+                    # query per sequence against its S keys, then o/MLP on g rows.
+                    ql = q.view(g, S, nq, d)[:, -1].unsqueeze(2)                  # [g, nq, 1, d]
+                    kl = _repeat_kv(kc[b0:b0 + g, :, :S], nq // nkv)
+                    vl = _repeat_kv(vc[b0:b0 + g, :, :S], nq // nkv)
+                    al = F.scaled_dot_product_attention(ql, kl, vl, is_causal=False, scale=d ** -0.5)
+                    xl = x.view(g, S, -1)[:, -1].contiguous()
+                    hl = add_rmsnorm(xl, F.linear(al.reshape(g, nq * d), L["o"]), L["ln2"], self.eps)
+                    dl = F.linear(silu_mul(F.linear(hl, L["gu"])), L["down"])
+                else:
+                    a = self._prefill_attn2(q, kc, vc, S, b0, g)
+                    o = F.linear(a, L["o"])
+                    h = add_rmsnorm(x, o, L["ln2"], self.eps)
+                    delta = F.linear(self._prefill_gu(h, L["gu"]), L["down"])
+            if not LAST_LAYER_TRIM:
+                xl = x.view(g, S, -1)[:, -1].contiguous()
+                dl = delta.view(g, S, -1)[:, -1].contiguous()
             h = add_rmsnorm(xl, dl, self.final_norm, self.eps)
             logits = F.linear(h, self.lm_head)
             st.first[b0:b0 + g] = torch.argmax(logits, dim=-1)
@@ -499,6 +514,52 @@ class Engine:
                     _log(f"prefill gate/up triton unavailable: {e!r}")
             self.gu_choice[key] = choice
         return gu_swiglu(h, w) if choice == "triton" else silu_mul(F.linear(h, w))
+
+    def _prefill_attn2(self, q2d, kc, vc, S, b0, g):
+        """q2d [g*S, nq*d] -> [g*S, nq*d]. Triton flash prefill vs the SDPA
+        variants; validated and timed on the first call per shape."""
+        nq, nkv, d = self.nq, self.nkv, self.d
+
+        def sdpa():
+            q = q2d.view(g, S, nq, d).transpose(1, 2)
+            a = self._prefill_attn(q, kc[b0:b0 + g, :, :S], vc[b0:b0 + g, :, :S])
+            return a.transpose(1, 2).reshape(g * S, nq * d)
+
+        def tri():
+            return flash_prefill(q2d, kc, vc, S, b0, g, nq, nkv, d)
+
+        key = (g, S)
+        choice = self.attn2_choice.get(key)
+        if choice is None:
+            choice = "sdpa"
+            if (self.cuda and not torch.cuda.is_current_stream_capturing()
+                    and os.environ.get("ENGINE_TRITON_FA") == "1"):   # FA2 measured faster on H100
+                try:
+                    ref = sdpa().float()
+                    got = tri().float()
+                    err = (got - ref).abs().max().item()
+                    if err < 0.05 * ref.abs().max().item() + 1e-2:
+                        ts = {}
+                        for name, fn in (("sdpa", sdpa), ("triton", tri)):
+                            fn()
+                            e0 = torch.cuda.Event(enable_timing=True)
+                            e1 = torch.cuda.Event(enable_timing=True)
+                            e0.record()
+                            for _ in range(3):
+                                fn()
+                            e1.record()
+                            e1.synchronize()
+                            ts[name] = e0.elapsed_time(e1) / 3
+                        choice = min(ts, key=ts.get)
+                        _log(f"prefill attention {key}: {ts} err={err:.3g} -> {choice}")
+                    else:
+                        _log(f"prefill attention triton mismatch {err:.3g}")
+                except Exception as e:  # pragma: no cover
+                    _log(f"triton prefill attention unavailable: {e!r}")
+            elif not self.cuda and os.environ.get("ENGINE_TEST_TRITON_FA") == "1":
+                choice = "triton"
+            self.attn2_choice[key] = choice
+        return tri() if choice == "triton" else sdpa()
 
     def _prefill_attn(self, q, k, v):
         """Causal GQA attention for prefill. The first call per shape times the
@@ -905,7 +966,7 @@ class Engine:
                     modes += [(1, "tunedpdl")]
         if not self.cuda and os.environ.get("ENGINE_TEST_GEMV") == "1":
             modes = [(1, "tuned")]
-        spec_ts = [t for t in _spec_candidates(B) if t > 1 and n >= SPEC_MIN_N and B <= 16
+        spec_ts = [t for t in _spec_candidates(B) if t > 1 and n >= SPEC_MIN_N and B == 1
                    and os.environ.get("ENGINE_SPEC", "1") == "1"]
         best, best_time, report = (1, False), None, []
         pending = list(modes)
