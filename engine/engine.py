@@ -58,7 +58,7 @@ from kernels.ops import DecodeAttention, add_rmsnorm, qk_norm_rope_cache, silu_m
 PREFILL_TOKENS = 8192      # rows per prefill chunk (whole sequences per chunk)
 LOOKAHEAD = 8              # plain mode: steps enqueued ahead of the one yielded
 MULTI = int(os.environ.get("ENGINE_MULTI", "4"))   # decode steps per graph launch
-SPEC_MARGIN = 0.96         # speculative must beat plain by 4% on warmup
+SPEC_MARGIN = 0.90         # speculative must beat plain by 10% on warmup
 GEMV_MAX_M = 128           # Triton skinny GEMMs up to this many rows
 SPLIT_QKV, SPLIT_O, SPLIT_DOWN = 2, 4, 4
 CALIBRATION_BUDGET_S = 150.0
@@ -895,7 +895,7 @@ class Engine:
                     modes += [(1, "tunedpdl")]
         if not self.cuda and os.environ.get("ENGINE_TEST_GEMV") == "1":
             modes = [(1, "tuned")]
-        spec_ts = [t for t in _spec_candidates(B) if t > 1 and n >= 4 and B <= 4
+        spec_ts = [t for t in _spec_candidates(B) if t > 1 and n >= 4 and B == 1
                    and os.environ.get("ENGINE_SPEC", "1") == "1"]
         best, best_time, report = (1, False), None, []
         pending = list(modes)
