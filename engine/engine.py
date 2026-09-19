@@ -35,7 +35,7 @@ from kernels.ops import DecodeAttention, add_rmsnorm, qk_norm_rope_cache, silu_m
 
 PREFILL_TOKENS = 8192      # rows per prefill chunk (whole sequences per chunk)
 LOOKAHEAD = 8              # plain mode: steps enqueued ahead of the one yielded
-SPEC_MARGIN = 0.95         # speculative must beat plain by 5% on warmup
+SPEC_MARGIN = 0.85         # speculative must beat plain by 15% on warmup
 GEMV_MAX_M = 128           # Triton skinny GEMMs up to this many rows
 SPLIT_QKV, SPLIT_O, SPLIT_DOWN = 2, 4, 4
 CALIBRATION_BUDGET_S = 150.0
@@ -121,7 +121,7 @@ class _Runner:
             self.inp = torch.zeros((B, t), device=dev, dtype=torch.int64)
             self.out = torch.zeros((B, t), device=dev, dtype=torch.int64)
         self.graph = None
-        if use_gemv:
+        if use_gemv == "tuned":
             eng._tune_gemms(B * t)
 
     def step(self, eng, st):
@@ -391,7 +391,7 @@ class Engine:
     def _forward_step(self, st, toks, pos, t, attn, use_gemv):
         """toks: [B*T] ids, sequence b's token j at position pos[b]+j. Returns argmax [B*T]."""
         if use_gemv:
-            return self._forward_step_gemv(st, toks, pos, t, attn)
+            return self._forward_step_gemv(st, toks, pos, t, attn, use_gemv)
         nq, nkv, d = self.nq, self.nkv, self.d
         x = F.embedding(toks, self.embed)
         h = add_rmsnorm(x, None, self.layers[0]["ln1"], self.eps)
@@ -511,25 +511,27 @@ class Engine:
                 report.append(f"pmlp=ERR {e!r}")
         _log(f"gemm plan M={M}: " + "; ".join(report))
 
-    def _gemm(self, name, x, w):
-        return _gemm_run(name, self.gemm_plan[(name, x.shape[0])], x, w)
-
-    def _forward_step_gemv(self, st, toks, pos, t, attn):
+    def _forward_step_gemv(self, st, toks, pos, t, attn, plan_name):
+        M = toks.shape[0]
+        if plan_name == "tuned":
+            plan = {k: self.gemm_plan[(k, M)] for k in ("qkv", "o", "gu", "down", "lm", "mlp")}
+        else:   # the fixed split plan of v2-v5
+            plan = dict(qkv="tr2", o="tr4", gu="tr", down="tr4", lm="tr1", mlp="sep")
         nq, nkv, d = self.nq, self.nkv, self.d
         x = F.embedding(toks, self.embed)
         h = add_rmsnorm(x, None, self.layers[0]["ln1"], self.eps)
         n = len(self.layers)
         for li, L in enumerate(self.layers):
-            qkv = self._gemm("qkv", h, L["qkv"])
+            qkv = _gemm_run("qkv", plan["qkv"], h, L["qkv"])
             a = self._attend(qkv, L, st.k_cache[li], st.v_cache[li], pos, t, attn)
-            h = add_rmsnorm(x, self._gemm("o", a, L["o"]), L["ln2"], self.eps)
-            if self.gemm_plan[("mlp", h.shape[0])] == "pmlp":
-                delta = self.pmlp[h.shape[0]](h, L["gu"], L["down"])
+            h = add_rmsnorm(x, _gemm_run("o", plan["o"], a, L["o"]), L["ln2"], self.eps)
+            if plan["mlp"] == "pmlp":
+                delta = self.pmlp[M](h, L["gu"], L["down"])
             else:
-                delta = self._gemm("down", self._gemm("gu", h, L["gu"]), L["down"])
+                delta = _gemm_run("down", plan["down"], _gemm_run("gu", plan["gu"], h, L["gu"]), L["down"])
             nw = self.layers[li + 1]["ln1"] if li + 1 < n else self.final_norm
             h = add_rmsnorm(x, delta, nw, self.eps)
-        logits = self._gemm("lm", h, self.lm_head)
+        logits = _gemm_run("lm", plan["lm"], h, self.lm_head)
         return torch.argmax(logits, dim=-1)
 
     # ------------------------------------------------------------ decode loops
@@ -651,17 +653,17 @@ class Engine:
         """Time each decode mode on the warmup prompt; keep the fastest."""
         B = st.batch
         start = time.perf_counter()
-        modes = []
-        for t in _spec_candidates(B):
-            if t > 1 and n < 4:
-                continue
-            modes.append((t, False))
-            if self.cuda and B * t <= GEMV_MAX_M and os.environ.get("ENGINE_NO_GEMV") != "1":
-                modes.append((t, True))
+        gemv_ok = self.cuda and os.environ.get("ENGINE_NO_GEMV") != "1"
+        modes = [(1, False)]
+        if gemv_ok and B <= GEMV_MAX_M:
+            modes += [(1, "fixed"), (1, "tuned")]
         if not self.cuda and os.environ.get("ENGINE_TEST_GEMV") == "1":
-            modes = [(t, True) for t, _ in modes if B * t <= GEMV_MAX_M]
+            modes = [(1, "tuned")]
+        spec_ts = [t for t in _spec_candidates(B) if t > 1 and n >= 4 and B == 1]
         best, best_time, report = (1, False), None, []
-        for t, g in modes:
+        pending = list(modes)
+        while pending:
+            t, g = pending.pop(0)
             if (t, g) != (1, False) and (time.perf_counter() - start > CALIBRATION_BUDGET_S
                                          or self._late()):
                 report.append(f"T={t} gemv={g}: skipped (budget)")
@@ -689,6 +691,10 @@ class Engine:
                     best, best_time = (t, g), eff
             except Exception as e:  # pragma: no cover
                 report.append(f"T={t} gemv={g}: failed {e!r}")
+            if not pending and spec_ts:
+                # speculative modes reuse the best plain matmul plan
+                pending = [(ts, best[1]) for ts in spec_ts]
+                spec_ts = []
         st.mode = best
         _log(f"B={B} S={S} n={n} calibration ({time.perf_counter() - start:.1f}s): "
              f"{'; '.join(report)} -> {best}")
@@ -711,7 +717,7 @@ class Engine:
                 self._calibrate(st, ids, input_ids, S, n)
             else:
                 st.mode = (int(os.environ.get("ENGINE_MODE", "1")),
-                           os.environ.get("ENGINE_TEST_GEMV") == "1")
+                           "tuned" if os.environ.get("ENGINE_TEST_GEMV") == "1" else False)
 
         t, g = st.mode
         if t == 1 or n == 1:
