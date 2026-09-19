@@ -28,6 +28,7 @@ import torch.nn.functional as F
 from transformers import AutoModelForCausalLM
 
 from kernels.fused_attn import FusedDecodeAttention
+from kernels.mega import MegaDecode
 from kernels.mlp import PersistentMLP
 from kernels.gemv import gemv, gemv_m1, gemv_m1_swiglu, gemv_rows, gemv_swiglu, gemv_tma
 from kernels.spec import accept as spec_accept, draft as spec_draft
@@ -116,7 +117,11 @@ class _Runner:
         self.use_gemv = use_gemv
         B = st.batch
         cls = FusedDecodeAttention if FUSED_ATTN else DecodeAttention
+        if use_gemv == "mega":
+            cls = FusedDecodeAttention
         self.attn = cls(B, t, st.capacity, eng.nq, eng.nkv, eng.d, dev, eng.num_sms)
+        self.mega = (MegaDecode(eng, st, self.attn, eng.num_sms if eng.cuda else 1)
+                     if use_gemv == "mega" else None)
         self.pos = torch.zeros((B,), device=dev, dtype=torch.int32)
         if t == 1:
             self.tok = torch.zeros((B,), device=dev, dtype=torch.int64)
@@ -131,7 +136,9 @@ class _Runner:
             eng._tune_gemms(B * t)
 
     def step(self, eng, st):
-        if self.t == 1:
+        if self.mega is not None:
+            self.mega(eng, st, self.tok, self.pos)
+        elif self.t == 1:
             nxt = eng._forward_step(st, self.tok, self.pos, 1, self.attn, self.use_gemv)
             self.tok.copy_(nxt)
             self.pos.add_(1)
@@ -223,7 +230,7 @@ class Engine:
         global _NUM_SMS, _TMA_OK
         _NUM_SMS = self.num_sms if self.cuda else 4
         _TMA_OK = (self.cuda and torch.cuda.get_device_capability(self.device)[0] == 9
-                   and os.environ.get("ENGINE_NO_TMA") != "1")
+                   and os.environ.get("ENGINE_TMA") == "1")  # off until tested alone
 
         base = model.model
         self.rotary = base.rotary_emb
@@ -246,7 +253,22 @@ class Engine:
                 ))
                 at.q_proj = at.k_proj = at.v_proj = None
                 mlp.gate_proj = mlp.up_proj = None
+        tied = self.lm_head.data_ptr() == self.embed.data_ptr()
         del model
+        # Stack per-layer weights (for the megakernel) and keep per-layer views.
+        with torch.no_grad():
+            for key, attr in (("qkv", "w_qkv"), ("o", "w_o"), ("gu", "w_gu"), ("down", "w_down"),
+                              ("ln1", "w_ln1"), ("ln2", "w_ln2"), ("qn", "w_qn"), ("kn", "w_kn")):
+                stacked = torch.empty((self.n_layers,) + tuple(self.layers[0][key].shape),
+                                      device=self.device, dtype=self.layers[0][key].dtype)
+                for i, L in enumerate(self.layers):
+                    stacked[i].copy_(L[key])
+                    L[key] = stacked[i]
+                setattr(self, attr, stacked)
+                if self.cuda:
+                    torch.cuda.empty_cache()
+        self.mega_ok = (tied and (self.cuda or os.environ.get("ENGINE_TEST_MEGA") == "1")
+                        and os.environ.get("ENGINE_NO_MEGA") != "1")
         if self.cuda:
             torch.cuda.empty_cache()
 
@@ -284,6 +306,28 @@ class Engine:
         capacity = -(-needed // 128) * 128
         self.state = _State(self, batch, capacity)
         return self.state
+
+    def _mega_matches(self, st, ids, S, steps=4):
+        """Run a few real decode steps through the cuBLAS path and the
+        megakernel from the same prefill; accept only identical tokens."""
+        try:
+            outs = []
+            for plan in (False, "mega"):
+                r = st.runner(self, 1, plan)
+                self._prefill(ids, st)
+                r.tok.copy_(st.first)
+                r.pos.fill_(S)
+                toks = []
+                for _ in range(steps):
+                    r.run(self, st)
+                    toks.append(r.tok.clone())
+                outs.append(torch.stack(toks))
+            ok = bool(torch.equal(outs[0], outs[1]))
+            _log(f"megakernel validation: {'ok' if ok else 'MISMATCH'}")
+            return ok
+        except Exception as e:  # pragma: no cover
+            _log(f"megakernel unavailable: {e!r}")
+            return False
 
     def _late(self):
         return time.perf_counter() - self.t_init > WARMUP_DEADLINE_S
@@ -673,6 +717,8 @@ class Engine:
         modes = [(1, False)]
         if gemv_ok and B <= GEMV_MAX_M:
             modes += [(1, "fixed"), (1, "tuned")]
+        if self.mega_ok and B <= 16 and n >= 4 and self._mega_matches(st, ids, S):
+            modes.append((1, "mega"))
         if not self.cuda and os.environ.get("ENGINE_TEST_GEMV") == "1":
             modes = [(1, "tuned")]
         spec_ts = [t for t in _spec_candidates(B) if t > 1 and n >= 4 and B == 1]
