@@ -26,12 +26,25 @@ import triton.language as tl
 from kernels.fused_attn import _norm_rope_half
 
 _DOT_F32 = os.environ.get("TRITON_INTERPRET") == "1"
+_FENCE = os.environ.get("TRITON_INTERPRET") != "1"
 
 
 @triton.jit
-def _wait(ptr, target):
+def _fence(FENCE: tl.constexpr):
+    """GPU-scope acq_rel fence executed by every thread of the program (the
+    CUDA memory model needs each writer to fence before a flag is raised)."""
+    if FENCE:
+        dummy = tl.arange(0, 256)
+        tl.inline_asm_elementwise("fence.acq_rel.gpu; mov.u32 $0, $1;", "=r,r", [dummy],
+                                  dtype=tl.int32, is_pure=False, pack=1)
+
+
+@triton.jit
+def _wait(ptr, target, FENCE: tl.constexpr):
     while tl.atomic_add(ptr, 0, sem="acquire") < target:
         pass
+    tl.debug_barrier()
+    _fence(FENCE)
 
 
 @triton.jit
@@ -51,7 +64,8 @@ def _prefetch_rows(w_ptr, r0, r1, K, MAXR: tl.constexpr, PREFETCH: tl.constexpr)
 
 
 @triton.jit
-def _signal(ptr):
+def _signal(ptr, FENCE: tl.constexpr):
+    _fence(FENCE)
     tl.debug_barrier()
     tl.atomic_add(ptr, 1, sem="release")
 
@@ -86,15 +100,16 @@ def _residual_chunk(res_ptr, emb_ptr, tok, d_ptr, offs_m, mmask, offs_k, H,
 def _normed_rows(res_ptr, emb_ptr, tok, d_ptr, ln_ptr, res_out_ptr, w_ptr, out_ptr,
                  M, H, N, r0, r1, eps, write_res,
                  FIRST: tl.constexpr, HAS_D: tl.constexpr, SWIGLU: tl.constexpr,
-                 BM: tl.constexpr, BN: tl.constexpr, BK: tl.constexpr, DOT_F32: tl.constexpr):
+                 BM: tl.constexpr, BN: tl.constexpr, BK: tl.constexpr, DOT_F32: tl.constexpr,
+                 BKS: tl.constexpr = 512):
     """out[:, r0:r1] = rmsnorm(residual) @ W[r0:r1]^T (SWIGLU: silu(g)*u with
     up rows at W[N + r]). Writes the residual to res_out if write_res."""
     offs_m = tl.arange(0, BM)
     mmask = offs_m < M
     # row statistics (identical in every program: same data, same order)
     ss = tl.zeros([BM], tl.float32)
-    for k0 in range(0, H, BK):
-        offs_k = k0 + tl.arange(0, BK)
+    for k0 in range(0, H, BKS):
+        offs_k = k0 + tl.arange(0, BKS)
         x = _residual_chunk(res_ptr, emb_ptr, tok, d_ptr, offs_m, mmask, offs_k, H, FIRST, HAS_D)
         if write_res:
             tl.store(res_out_ptr + offs_m[:, None] * H + offs_k[None, :], x, mask=mmask[:, None])
@@ -277,7 +292,7 @@ def _mega_kernel(tok_ptr, pos_ptr, emb_ptr,
                  H: tl.constexpr, I: tl.constexpr, NQKV: tl.constexpr,
                  NKV: tl.constexpr, GROUP: tl.constexpr, D: tl.constexpr, NSPLIT: tl.constexpr,
                  BM: tl.constexpr, BN: tl.constexpr, BK: tl.constexpr, BLOCK_N: tl.constexpr,
-                 DOT_F32: tl.constexpr, PREFETCH: tl.constexpr):
+                 DOT_F32: tl.constexpr, PREFETCH: tl.constexpr, FENCE: tl.constexpr):
     pid = tl.program_id(0)
     offs_m = tl.arange(0, BM)
     mmask = offs_m < M
@@ -310,13 +325,13 @@ def _mega_kernel(tok_ptr, pos_ptr, emb_ptr,
                          M, H, NQKV, r0, r1, eps, pid == 0,
                          True, False, False, BM, BN, BK, DOT_F32)
         else:
-            _wait(c_dn, l * G)
+            _wait(c_dn, l * G, FENCE)
             _normed_rows(res_b, emb_ptr, tok, dl_ptr, ln1_ptr + l * H, res_a, wq, qkv_ptr,
                          M, H, NQKV, r0, r1, eps, pid == 0,
                          False, True, False, BM, BN, BK, DOT_F32)
-        _signal(c_qkv)
+        _signal(c_qkv, FENCE)
         # ---- P2: attention
-        _wait(c_qkv, (l + 1) * G)
+        _wait(c_qkv, (l + 1) * G, FENCE)
         n_done = 0
         for item in range(pid, n_items, G):
             n_done += _attn_item(qkv_ptr, qn_ptr + l * D, kn_ptr + l * D, cos_ptr, sin_ptr,
@@ -324,6 +339,7 @@ def _mega_kernel(tok_ptr, pos_ptr, emb_ptr,
                                  po_ptr, pm_ptr, pl_ptr, acnt_ptr, att_ptr, item,
                                  stride_cb, stride_ch, scale, eps, CHUNK,
                                  NKV, GROUP, 16, D, BLOCK_N, NSPLIT, DOT_F32)
+        _fence(FENCE)
         tl.debug_barrier()
         if n_done > 0:
             tl.atomic_add(c_att, n_done, sem="release")
@@ -331,29 +347,29 @@ def _mega_kernel(tok_ptr, pos_ptr, emb_ptr,
         r0 = (pid * H) // G
         r1 = ((pid + 1) * H) // G
         _prefetch_rows(wo, r0, r1, NQ * D, 32, PREFETCH)
-        _wait(c_att, (l + 1) * M * NKV)
+        _wait(c_att, (l + 1) * M * NKV, FENCE)
         _plain_rows(att_ptr, wo, o_ptr, M, NQ * D, H, r0, r1,
                     BM, BN, BK, DOT_F32)
-        _signal(c_o)
+        _signal(c_o, FENCE)
         # ---- P4: gate/up + swiglu (residual += o)
         r0 = (pid * I) // G
         r1 = ((pid + 1) * I) // G
         _prefetch_rows(wgu, r0, r1, H, 16, PREFETCH)
         _prefetch_rows(wgu + I * H, r0, r1, H, 16, PREFETCH)
-        _wait(c_o, (l + 1) * G)
+        _wait(c_o, (l + 1) * G, FENCE)
         _normed_rows(res_a, emb_ptr, tok, o_ptr, ln2_ptr + l * H, res_b,
                      wgu, act_ptr,
                      M, H, I, r0, r1, eps, pid == 0,
                      False, True, True, BM, BN, BK, DOT_F32)
-        _signal(c_gu)
+        _signal(c_gu, FENCE)
         # ---- P5: down projection
         r0 = (pid * H) // G
         r1 = ((pid + 1) * H) // G
         _prefetch_rows(wd, r0, r1, I, 8, PREFETCH)
-        _wait(c_gu, (l + 1) * G)
+        _wait(c_gu, (l + 1) * G, FENCE)
         _plain_rows(act_ptr, wd, dl_ptr, M, I, H, r0, r1,
                     BM, BN, BK, DOT_F32)
-        _signal(c_dn)
+        _signal(c_dn, FENCE)
         wq += NQKV * H
         wo += H * NQ * D
         wgu += 2 * I * H
@@ -362,10 +378,10 @@ def _mega_kernel(tok_ptr, pos_ptr, emb_ptr,
         vc += stride_cl
 
     # ---- P6: final norm + lm head + argmax
-    _wait(c_dn, n_layers * G)
+    _wait(c_dn, n_layers * G, FENCE)
     ss = tl.zeros([BM], tl.float32)
-    for k0 in range(0, H, BK):
-        offs_k = k0 + tl.arange(0, BK)
+    for k0 in range(0, H, 512):
+        offs_k = k0 + tl.arange(0, 512)
         x = _residual_chunk(res_b, emb_ptr, tok, dl_ptr, offs_m, mmask, offs_k, H, False, True)
         xf = x.to(tl.float32)
         ss += tl.sum(xf * xf, axis=1)
@@ -403,9 +419,12 @@ def _mega_kernel(tok_ptr, pos_ptr, emb_ptr,
         best_v = tl.where(better, tmax, best_v)
     tl.store(bval_ptr + pid * BM + offs_m, best_v)
     tl.store(bidx_ptr + pid * BM + offs_m, best_i)
+    _fence(FENCE)
     tl.debug_barrier()
     fin = tl.atomic_add(c_lm, 1, sem="acq_rel")
     if fin == G - 1:
+        tl.debug_barrier()
+        _fence(FENCE)
         bv = tl.full([BM], float("-inf"), tl.float32)
         bi = tl.zeros([BM], tl.int32)
         for p in range(0, G):
@@ -458,5 +477,5 @@ class MegaDecode:
             kc.stride(0), kc.stride(1), kc.stride(2),
             H=self.H, I=self.I, NQKV=self.nqkv, NKV=eng.nkv, GROUP=eng.nq // eng.nkv, D=eng.d,
             NSPLIT=ws.nsplit, BM=16, BN=32, BK=128, BLOCK_N=64, DOT_F32=_DOT_F32,
-            PREFETCH=self.prefetch, num_warps=8, num_stages=3,
+            PREFETCH=self.prefetch, FENCE=_FENCE, num_warps=8, num_stages=3,
         )

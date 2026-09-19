@@ -26,6 +26,15 @@ from kernels.ops import _DOT_F32, DecodeAttention, _load_rows
 
 
 @triton.jit
+def _fence(FENCE: tl.constexpr):
+    """GPU-scope acq_rel fence by every thread (publishing partials safely)."""
+    if FENCE:
+        dummy = tl.arange(0, 128)
+        tl.inline_asm_elementwise("fence.acq_rel.gpu; mov.u32 $0, $1;", "=r,r", [dummy],
+                                  dtype=tl.int32, is_pure=False, pack=1)
+
+
+@triton.jit
 def _norm_rope_half(x1, x2, w_ptr, cos_ptr, sin_ptr, pos, offs_h, mask2,
                     eps, D: tl.constexpr, HALF: tl.constexpr):
     """x1, x2: [R, HALF] fp32 halves of R bf16 head vectors -> roped bf16 halves.
@@ -57,7 +66,7 @@ def _fused_attn_kernel(qkv_ptr, qw_ptr, kw_ptr, cos_ptr, sin_ptr,
                        NKV: tl.constexpr, GROUP: tl.constexpr, T: tl.constexpr,
                        RPAD: tl.constexpr, TPAD: tl.constexpr, D: tl.constexpr,
                        BLOCK_N: tl.constexpr, NSPLIT: tl.constexpr, QSPLIT: tl.constexpr,
-                       DOT_F32: tl.constexpr):
+                       DOT_F32: tl.constexpr, FENCE: tl.constexpr = False):
     pid = tl.program_id(0)
     split = tl.program_id(1)
     b = pid // NKV
@@ -147,10 +156,12 @@ def _fused_attn_kernel(qkv_ptr, qw_ptr, kw_ptr, cos_ptr, sin_ptr,
         tl.store(m_ptr + part + offs_r, m_i, mask=rmask)
         tl.store(l_ptr + part + offs_r, l_i, mask=rmask)
         tl.store(o_ptr + (part + offs_r)[:, None] * D + offs_d[None, :], acc, mask=rmask[:, None])
+        _fence(FENCE)
         tl.debug_barrier()
         done = tl.atomic_add(cnt_ptr + pid, 1, sem="acq_rel")
         tl.debug_barrier()
         if done == NSPLIT - 1:
+            _fence(FENCE)
             # every other split has published its partials: merge them
             base_r = pid * NSPLIT * ROWS + offs_r
             m_max = tl.full([RPAD], float("-inf"), tl.float32)
@@ -196,6 +207,6 @@ class FusedDecodeAttention(DecodeAttention):
             k_cache.stride(0), k_cache.stride(1), M * W, self.scale, eps, self.chunk,
             NKV=self.nkv, GROUP=self.group, T=T, RPAD=self.rpad, TPAD=self.tpad,
             D=self.d, BLOCK_N=64, NSPLIT=self.nsplit, QSPLIT=qsplit,
-            DOT_F32=_DOT_F32, num_warps=4, num_stages=2,
+            DOT_F32=_DOT_F32, FENCE=not _DOT_F32, num_warps=4, num_stages=2,
         )
         return out
