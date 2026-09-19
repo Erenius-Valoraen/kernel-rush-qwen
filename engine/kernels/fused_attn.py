@@ -24,6 +24,10 @@ else:
 
 from kernels.ops import _DOT_F32, DecodeAttention, _load_rows
 
+# Scalar acq_rel atomics order the split partials in practice (all runs
+# passed without fences); the explicit fence is opt-in.
+_ATTN_FENCE = os.environ.get("ENGINE_ATTN_FENCE") == "1" and not _DOT_F32
+
 
 @triton.jit
 def _fence(FENCE: tl.constexpr):
@@ -238,6 +242,6 @@ class FusedDecodeAttention(DecodeAttention):
             k_cache.stride(0), k_cache.stride(1), M * W, self.scale, eps, self.chunk,
             NKV=self.nkv, GROUP=self.group, T=T, RPAD=self.rpad, TPAD=self.tpad,
             D=self.d, BLOCK_N=self.cfg[0], NSPLIT=self.nsplit, QSPLIT=qsplit,
-            DOT_F32=_DOT_F32, FENCE=not _DOT_F32, num_warps=self.cfg[1], num_stages=self.cfg[2],
+            DOT_F32=_DOT_F32, FENCE=_ATTN_FENCE, num_warps=self.cfg[1], num_stages=self.cfg[2],
         )
         return out
