@@ -64,6 +64,7 @@ CALIBRATION_BUDGET_S = 150.0
 CALIB_REPS = 4                # timed repetitions per decode mode (min taken)
 WARMUP_DEADLINE_S = 180.0     # since __init__ began; the platform allows 300
 FUSED_ATTN = os.environ.get("ENGINE_UNFUSED_ATTN") != "1"
+DIAG = os.environ.get("ENGINE_DIAG", "1") == "1"      # telemetry-through-timing build
 
 
 def _log(msg):
@@ -925,8 +926,19 @@ class Engine:
                 st.mode = (int(os.environ.get("ENGINE_MODE", "1")),
                            "tuned" if os.environ.get("ENGINE_TEST_GEMV") == "1" else False)
 
+        st.calls = getattr(st, "calls", 0) + 1
+        if DIAG and st.calls == 1:
+            import diag
+            st.diag = diag.measure(self, st, S, n)
+            _log(f"DIAG {st.diag}")
+
         t, g = st.mode
         if t == 1 or n == 1:
-            yield from self._plain(st, ids, S, n, g)
+            gen = self._plain(st, ids, S, n, g)
         else:
-            yield from self._spec(st, ids, input_ids, S, n, t, g)
+            gen = self._spec(st, ids, input_ids, S, n, t, g)
+        if DIAG and st.calls > 1 and self.cuda:
+            import diag
+            pre, per = diag.sleeps(st.diag, st.calls - 1)
+            gen = diag.wrap(gen, pre, per, n)
+        yield from gen
