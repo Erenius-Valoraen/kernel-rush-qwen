@@ -46,6 +46,7 @@ import torch.nn.functional as F
 from transformers import AutoModelForCausalLM
 
 from kernels.fused_attn import FusedDecodeAttention
+from kernels import pdl
 from kernels.mega import MegaDecode
 from kernels.mlp import PersistentMLP
 from kernels.prefill_mlp import gu_swiglu
@@ -205,17 +206,21 @@ class _Runner:
                 self.step(eng, st)
         torch.cuda.current_stream().wait_stream(s)
         torch.cuda.synchronize()
-        g = torch.cuda.CUDAGraph()
-        with torch.cuda.graph(g):
-            self.step(eng, st)
-        torch.cuda.synchronize()
-        self.graph = g
-        if self.t == 1 and MULTI > 1:
-            gm = torch.cuda.CUDAGraph()
-            with torch.cuda.graph(gm):
-                self.steps_multi(eng, st)
+        pdl.set_active(self.use_gemv == "fixedpdl")
+        try:
+            g = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(g):
+                self.step(eng, st)
             torch.cuda.synchronize()
-            self.graph_multi = gm
+            self.graph = g
+            if self.t == 1 and MULTI > 1:
+                gm = torch.cuda.CUDAGraph()
+                with torch.cuda.graph(gm):
+                    self.steps_multi(eng, st)
+                torch.cuda.synchronize()
+                self.graph_multi = gm
+        finally:
+            pdl.set_active(False)
 
 
 class _State:
@@ -252,6 +257,7 @@ class _State:
 class Engine:
     def __init__(self, model_path: str) -> None:
         self.t_init = time.perf_counter()
+        self.pdl_ok = pdl.enable()
         torch.backends.cuda.matmul.allow_tf32 = False
         torch.backends.cudnn.allow_tf32 = False
         self.device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
@@ -350,12 +356,12 @@ class Engine:
         self.state = _State(self, batch, capacity)
         return self.state
 
-    def _mega_matches(self, st, ids, S, steps=4, plan="mega"):
+    def _mega_matches(self, st, ids, S, steps=4, plan="mega", ref=False):
         """Run a few real decode steps through the cuBLAS path and the
         megakernel from the same prefill; accept only identical tokens."""
         try:
             outs = []
-            for pl in (False, plan):
+            for pl in (ref, plan):
                 r = st.runner(self, 1, pl)
                 self._prefill(ids, st)
                 r.tok.copy_(st.first)
@@ -655,6 +661,8 @@ class Engine:
 
     def _forward_step_gemv(self, st, toks, pos, t, attn, plan_name):
         M = toks.shape[0]
+        if plan_name == "fixedpdl":
+            plan_name = "fixed"
         if plan_name == "tuned":
             plan = {k: self.gemm_plan[(k, M)] for k in ("qkv", "o", "gu", "down", "lm", "mlp")}
         else:   # the fixed split plan of v2-v5
@@ -824,6 +832,8 @@ class Engine:
                     modes.append((1, plan))
         if gemv_ok and B <= GEMV_MAX_M:
             modes += [(1, "fixed")]
+            if self.pdl_ok and n >= 4 and not self._late()                     and self._mega_matches(st, ids, S, steps=8, plan="fixedpdl", ref="fixed"):
+                modes += [(1, "fixedpdl")]
             if os.environ.get("ENGINE_TUNED", "1") == "1":
                 modes += [(1, "tuned")]
         if not self.cuda and os.environ.get("ENGINE_TEST_GEMV") == "1":

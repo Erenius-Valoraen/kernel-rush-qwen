@@ -22,7 +22,9 @@ else:
         for bn, w, st in [(64, 4, 2), (64, 4, 3), (32, 4, 3), (128, 4, 2), (128, 8, 3), (64, 8, 3)]
     ]
 
+from kernels import pdl
 from kernels.ops import _DOT_F32, DecodeAttention, _load_rows
+from kernels.pdl import pdl_launch, pdl_wait
 
 # Scalar acq_rel atomics order the split partials in practice (all runs
 # passed without fences); the explicit fence is opt-in.
@@ -70,8 +72,11 @@ def _fused_attn_kernel(qkv_ptr, qw_ptr, kw_ptr, cos_ptr, sin_ptr,
                        NKV: tl.constexpr, GROUP: tl.constexpr, T: tl.constexpr,
                        RPAD: tl.constexpr, TPAD: tl.constexpr, D: tl.constexpr,
                        BLOCK_N: tl.constexpr, NSPLIT: tl.constexpr, QSPLIT: tl.constexpr,
-                       DOT_F32: tl.constexpr, FENCE: tl.constexpr = False):
-    pid = tl.program_id(0)
+                       DOT_F32: tl.constexpr, FENCE: tl.constexpr = False,
+                       PDL: tl.constexpr = False):
+    z = pdl_wait(PDL)
+    pdl_launch(PDL)
+    pid = tl.program_id(0) + z
     split = tl.program_id(1)
     b = pid // NKV
     kvh = pid % NKV
@@ -236,12 +241,15 @@ class FusedDecodeAttention(DecodeAttention):
         qsplit = qkv.shape[0] if qkv.dim() == 3 else 0
         M, W = qkv.shape[-2], qkv.shape[-1]
         out = torch.empty((B * T, self.nq * self.d), device=qkv.device, dtype=torch.bfloat16)
+        pdl.before_launch()
         _fused_attn_kernel[(B * self.nkv, self.nsplit)](
             qkv, q_w, k_w, cos, sin, k_cache, v_cache, pos_t,
             self.o, self.m, self.l, self.cnt, out,
             k_cache.stride(0), k_cache.stride(1), M * W, self.scale, eps, self.chunk,
             NKV=self.nkv, GROUP=self.group, T=T, RPAD=self.rpad, TPAD=self.tpad,
             D=self.d, BLOCK_N=self.cfg[0], NSPLIT=self.nsplit, QSPLIT=qsplit,
-            DOT_F32=_DOT_F32, FENCE=_ATTN_FENCE, num_warps=self.cfg[1], num_stages=self.cfg[2],
+            DOT_F32=_DOT_F32, FENCE=_ATTN_FENCE, PDL=pdl.compiled(),
+            num_warps=self.cfg[1], num_stages=self.cfg[2],
         )
+        pdl.after_launch()
         return out

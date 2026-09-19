@@ -14,6 +14,9 @@ import torch
 import triton
 import triton.language as tl
 
+from kernels import pdl
+from kernels.pdl import pdl_launch, pdl_wait
+
 _DOT_F32 = os.environ.get("TRITON_INTERPRET") == "1"
 
 if os.environ.get("TRITON_INTERPRET") == "1":
@@ -43,10 +46,12 @@ def _prune(configs, named_args, **kwargs):
 @triton.jit
 def _gemv_kernel(x_ptr, w_ptr, out_ptr, M, N, K, K_SPLIT,
                  BM: tl.constexpr, BN: tl.constexpr, BK: tl.constexpr,
-                 PARTIAL: tl.constexpr, DOT_F32: tl.constexpr):
+                 PARTIAL: tl.constexpr, DOT_F32: tl.constexpr, PDL: tl.constexpr = False):
+    z = pdl_wait(PDL)
+    pdl_launch(PDL)
     pid_n = tl.program_id(0)
     pid_k = tl.program_id(1)
-    offs_m = tl.arange(0, BM)
+    offs_m = tl.arange(0, BM) + z
     offs_n = pid_n * BN + tl.arange(0, BN)
     mmask = offs_m < M
     acc = tl.zeros([BM, BN], tl.float32)
@@ -75,9 +80,11 @@ def _gemv_kernel(x_ptr, w_ptr, out_ptr, M, N, K, K_SPLIT,
 @triton.jit
 def _gemv_swiglu_kernel(x_ptr, w_ptr, out_ptr, M, I, K,
                         BM: tl.constexpr, BN: tl.constexpr, BK: tl.constexpr,
-                        DOT_F32: tl.constexpr):
+                        DOT_F32: tl.constexpr, PDL: tl.constexpr = False):
+    z = pdl_wait(PDL)
+    pdl_launch(PDL)
     pid_n = tl.program_id(0)
-    offs_m = tl.arange(0, BM)
+    offs_m = tl.arange(0, BM) + z
     offs_n = pid_n * BN + tl.arange(0, BN)
     mmask = offs_m < M
     acc_g = tl.zeros([BM, BN], tl.float32)
@@ -121,8 +128,10 @@ def gemv(x, w, split=1):
     else:
         out = torch.empty((split, M, N), device=x.device, dtype=torch.float32)
     grid = lambda meta: (N // meta["BN"], split)
+    pdl.before_launch()
     _gemv_kernel[grid](x, w, out, M, N, K, k_split, BM=_bm(M),
-                       PARTIAL=split > 1, DOT_F32=_DOT_F32)
+                       PARTIAL=split > 1, DOT_F32=_DOT_F32, PDL=pdl.compiled())
+    pdl.after_launch()
     return out
 
 
@@ -132,7 +141,10 @@ def gemv_swiglu(x, w_gu):
     I = w_gu.shape[0] // 2
     out = torch.empty((M, I), device=x.device, dtype=torch.bfloat16)
     grid = lambda meta: (I // meta["BN"],)
-    _gemv_swiglu_kernel[grid](x, w_gu, out, M, I, K, BM=_bm(M), DOT_F32=_DOT_F32)
+    pdl.before_launch()
+    _gemv_swiglu_kernel[grid](x, w_gu, out, M, I, K, BM=_bm(M), DOT_F32=_DOT_F32,
+                              PDL=pdl.compiled())
+    pdl.after_launch()
     return out
 
 

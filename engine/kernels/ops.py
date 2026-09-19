@@ -10,6 +10,9 @@ import torch
 import triton
 import triton.language as tl
 
+from kernels import pdl
+from kernels.pdl import pdl_launch, pdl_wait
+
 # Triton's CPU interpreter (used only for local testing) mis-computes bf16
 # tl.dot; upcast there. On GPU the bf16 MMA path is used.
 _DOT_F32 = os.environ.get("TRITON_INTERPRET") == "1"
@@ -38,8 +41,11 @@ def _load_rows(ptr, offs, mask, NSPLIT: tl.constexpr, split_stride):
 
 @triton.jit
 def _add_rmsnorm_kernel(x_ptr, d_ptr, w_ptr, y_ptr, n_cols, split_stride, eps,
-                        HAS_DELTA: tl.constexpr, DSPLIT: tl.constexpr, BLOCK: tl.constexpr):
-    row = tl.program_id(0).to(tl.int64)
+                        HAS_DELTA: tl.constexpr, DSPLIT: tl.constexpr, BLOCK: tl.constexpr,
+                        PDL: tl.constexpr = False):
+    z = pdl_wait(PDL)
+    pdl_launch(PDL)
+    row = tl.program_id(0).to(tl.int64) + z
     cols = tl.arange(0, BLOCK)
     mask = cols < n_cols
     offs = row * n_cols + cols
@@ -63,11 +69,13 @@ def add_rmsnorm(x, delta, weight, eps):
     M, N = x.shape
     y = torch.empty_like(x)
     dsplit = delta.shape[0] if delta is not None and delta.dim() == 3 else 0
+    pdl.before_launch()
     _add_rmsnorm_kernel[(M,)](
         x, delta if delta is not None else x, weight, y, N, M * N, eps,
         HAS_DELTA=delta is not None, DSPLIT=dsplit,
-        BLOCK=triton.next_power_of_2(N), num_warps=8,
+        BLOCK=triton.next_power_of_2(N), PDL=pdl.compiled(), num_warps=8,
     )
+    pdl.after_launch()
     return y
 
 
