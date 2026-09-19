@@ -360,33 +360,41 @@ class Engine:
             return F.scaled_dot_product_attention(q, k, v, is_causal=True, scale=scale,
                                                   enable_gqa=True)
 
+        def cudnn():
+            from torch.nn.attention import SDPBackend, sdpa_kernel
+            with sdpa_kernel(SDPBackend.CUDNN_ATTENTION):
+                return F.scaled_dot_product_attention(
+                    q, _repeat_kv(k, rep).contiguous(), _repeat_kv(v, rep).contiguous(),
+                    is_causal=True, scale=scale)
+
+        fns = {"expanded": expanded, "native": native, "cudnn": cudnn}
+
         key = tuple(q.shape)
         choice = self.attn_choice.get(key)
         if choice is None:
             choice = "expanded"
             if self.cuda and not torch.cuda.is_current_stream_capturing():
-                try:
-                    ref = expanded()
-                    got = native()
-                    if (got.float() - ref.float()).abs().max().item() < 0.02:
-                        ts = {}
-                        for name, fn in (("expanded", expanded), ("native", native)):
+                ref = expanded().float()
+                ts = {}
+                for name, fn in fns.items():
+                    try:
+                        if (fn().float() - ref).abs().max().item() >= 0.02:
+                            continue
+                        e0 = torch.cuda.Event(enable_timing=True)
+                        e1 = torch.cuda.Event(enable_timing=True)
+                        e0.record()
+                        for _ in range(3):
                             fn()
-                            e0 = torch.cuda.Event(enable_timing=True)
-                            e1 = torch.cuda.Event(enable_timing=True)
-                            e0.record()
-                            for _ in range(3):
-                                fn()
-                            e1.record()
-                            e1.synchronize()
-                            ts[name] = e0.elapsed_time(e1)
-                        if ts["native"] < ts["expanded"]:
-                            choice = "native"
-                        _log(f"prefill attn {key}: {ts} -> {choice}")
-                except Exception as e:  # pragma: no cover
-                    _log(f"native GQA unavailable: {e!r}")
+                        e1.record()
+                        e1.synchronize()
+                        ts[name] = e0.elapsed_time(e1)
+                    except Exception as e:  # pragma: no cover
+                        _log(f"prefill attn {name} unavailable: {e!r}")
+                if ts:
+                    choice = min(ts, key=ts.get)
+                _log(f"prefill attn {key}: {ts} -> {choice}")
                 self.attn_choice[key] = choice
-        return native() if choice == "native" else expanded()
+        return fns[choice]()
 
     def _forward_step(self, st, toks, pos, t, attn, use_gemv):
         """toks: [B*T] ids, sequence b's token j at position pos[b]+j. Returns argmax [B*T]."""
