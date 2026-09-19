@@ -55,6 +55,7 @@ from kernels.ops import DecodeAttention, add_rmsnorm, qk_norm_rope_cache, silu_m
 
 PREFILL_TOKENS = 8192      # rows per prefill chunk (whole sequences per chunk)
 LOOKAHEAD = 8              # plain mode: steps enqueued ahead of the one yielded
+MULTI = int(os.environ.get("ENGINE_MULTI", "4"))   # decode steps per graph launch
 SPEC_MARGIN = 0.85         # speculative must beat plain by 15% on warmup
 GEMV_MAX_M = 128           # Triton skinny GEMMs up to this many rows
 SPLIT_QKV, SPLIT_O, SPLIT_DOWN = 2, 4, 4
@@ -145,6 +146,8 @@ class _Runner:
         self.pos = torch.zeros((B,), device=dev, dtype=torch.int32)
         if t == 1:
             self.tok = torch.zeros((B,), device=dev, dtype=torch.int64)
+            self.tokbuf = torch.zeros((MULTI, B), device=dev, dtype=torch.int64)
+            self.graph_multi = None
         else:
             self.hist = torch.zeros((B, st.capacity), device=dev, dtype=torch.int32)
             self.hlen = torch.ones((B,), device=dev, dtype=torch.int32)
@@ -175,6 +178,18 @@ class _Runner:
         else:
             self.step(eng, st)
 
+    def steps_multi(self, eng, st):
+        for i in range(MULTI):
+            self.step(eng, st)
+            self.tokbuf[i].copy_(self.tok)
+
+    def run_multi(self, eng, st):
+        """MULTI decode steps; token of step i lands in tokbuf[i]."""
+        if self.graph_multi is not None:
+            self.graph_multi.replay()
+        else:
+            self.steps_multi(eng, st)
+
     def capture(self, eng, st):
         s = torch.cuda.Stream()
         s.wait_stream(torch.cuda.current_stream())
@@ -194,6 +209,12 @@ class _Runner:
             self.step(eng, st)
         torch.cuda.synchronize()
         self.graph = g
+        if self.t == 1 and MULTI > 1:
+            gm = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(gm):
+                self.steps_multi(eng, st)
+            torch.cuda.synchronize()
+            self.graph_multi = gm
 
 
 class _State:
@@ -671,25 +692,46 @@ class Engine:
         if self.host_buf is None or self.host_buf.shape[0] < n or self.host_buf.shape[1] != B:
             self.host_buf = torch.empty((n, B), dtype=torch.int64, pin_memory=True)
         host = self.host_buf
-        events = [None] * n
         stream = torch.cuda.current_stream()
+        # Blocks of decode steps: MULTI steps per graph launch while enough
+        # tokens remain, then single steps. One copy + one event per block.
+        blocks = []
+        row = 1
+        while row < n:
+            k = MULTI if (MULTI > 1 and n - row >= MULTI and r.graph_multi is not None) else 1
+            blocks.append((row, k))
+            row += k
+        events = [None] * len(blocks)
 
-        def launch(i):
-            if i > 0:
+        def launch(bi):
+            row, k = blocks[bi]
+            if k == 1:
                 r.run(self, st)
-            host[i].copy_(r.tok, non_blocking=True)
+                host[row].copy_(r.tok, non_blocking=True)
+            else:
+                r.run_multi(self, st)
+                host[row:row + k].copy_(r.tokbuf, non_blocking=True)
             ev = torch.cuda.Event()
             ev.record(stream)
-            events[i] = ev
+            events[bi] = ev
 
-        launch(0)
-        launched = 1
-        for i in range(n):
-            while launched < n and launched <= i + LOOKAHEAD:
+        host[0].copy_(st.first, non_blocking=True)
+        ev0 = torch.cuda.Event()
+        ev0.record(stream)
+        launched = 0
+        ahead = max(1, LOOKAHEAD // max(1, MULTI))
+        while launched < len(blocks) and launched < ahead:
+            launch(launched)
+            launched += 1
+        ev0.synchronize()
+        yield host[0].tolist()
+        for bi, (row, k) in enumerate(blocks):
+            while launched < len(blocks) and launched <= bi + ahead:
                 launch(launched)
                 launched += 1
-            events[i].synchronize()
-            yield host[i].tolist()
+            events[bi].synchronize()
+            for j in range(row, row + k):
+                yield host[j].tolist()
 
     def _spec(self, st, ids, input_ids, S, n, t, use_gemv, stats=None):
         """Speculative decoding with drafting/acceptance on device: steps are
