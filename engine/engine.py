@@ -781,6 +781,9 @@ class Engine:
                 # speculative modes reuse the best plain matmul plan
                 pending = [(ts, best[1]) for ts in spec_ts]
                 spec_ts = []
+        force = os.environ.get("ENGINE_FORCE_PLAN", "mega")   # EXPERIMENT: force megakernel
+        if force and (1, force) in modes:
+            best = (1, force)
         st.mode = best
         _log(f"B={B} S={S} n={n} calibration ({time.perf_counter() - start:.1f}s): "
              f"{'; '.join(report)} -> {best}")
