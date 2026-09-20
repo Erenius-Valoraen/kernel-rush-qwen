@@ -74,8 +74,10 @@ CALIB_REPS = int(os.environ.get("ENGINE_CALIB_REPS", "2"))   # timed repetitions
 # Draft head: a small MLP trained during warmup on the model's own greedy text
 # proposes the token after next; the model verifies it (exact greedy output).
 HEAD = os.environ.get("ENGINE_HEAD", "1") == "1"
-HEAD_TRAIN_S = float(os.environ.get("ENGINE_HEAD_TRAIN_S", "8"))
-HEAD_ROUNDS = int(os.environ.get("ENGINE_HEAD_ROUNDS", "4"))
+HEAD_TRAIN_S = float(os.environ.get("ENGINE_HEAD_TRAIN_S", "12"))
+HEAD_ROUNDS = int(os.environ.get("ENGINE_HEAD_ROUNDS", "8"))
+HEAD_T = int(os.environ.get("ENGINE_HEAD_T", "3"))          # widest verify step tried: 1 real token + T-1 chained drafts
+HEAD_T3_MAX_B = 16          # wider verify steps cost too many rows beyond this batch
 HEAD_BATCH = int(os.environ.get("ENGINE_HEAD_BATCH", "256"))
 HEAD_STEPS = int(os.environ.get("ENGINE_HEAD_STEPS", "96"))
 HEAD_VOCAB = 32768
@@ -284,26 +286,26 @@ class _TrainRunner(_Runner):
 class _HeadRunner(_Runner):
     """T=2 verify steps; the draft for the next step comes from the trained head."""
 
-    def __init__(self, eng, st, plan):
-        super().__init__(eng, st, 2, plan)
+    def __init__(self, eng, st, plan, t):
+        super().__init__(eng, st, t, plan)
         B = st.batch
-        self.draft = torch.zeros((B,), device=eng.device, dtype=torch.int64)
+        self.draft = torch.zeros((B, t - 1), device=eng.device, dtype=torch.int64)
         self.prev = torch.zeros((B,), device=eng.device, dtype=torch.int32)
         self.ar = torch.arange(B, device=eng.device)
 
     def step(self, eng, st):
-        B = st.batch
+        B, T = st.batch, self.t
         last = self.hist.gather(1, (self.hlen - 1).long().unsqueeze(1)).squeeze(1)
         self.inp[:, 0] = last
-        self.inp[:, 1] = self.draft
+        self.inp[:, 1:] = self.draft
         self.pos.copy_(self.hlen - 1)
-        nxt = eng._forward_step(st, self.inp.view(-1), self.pos, 2, self.attn, self.use_gemv)
-        self.out.copy_(nxt.view(B, 2))
-        h = eng._last_h.view(B, 2, -1)
+        nxt = eng._forward_step(st, self.inp.view(-1), self.pos, T, self.attn, self.use_gemv)
+        self.out.copy_(nxt.view(B, T))
+        h = eng._last_h.view(B, T, -1)
         self.prev.copy_(self.hlen)
-        spec_accept(self.hist, self.hlen, self.lim, self.inp, self.out, 2)
-        idx = (self.hlen - self.prev - 1).clamp_(0, 1).long()
-        self.draft.copy_(eng._head_draft(h[self.ar, idx], self.out[self.ar, idx]))
+        spec_accept(self.hist, self.hlen, self.lim, self.inp, self.out, T)
+        idx = (self.hlen - self.prev - 1).clamp_(0, T - 1).long()
+        self.draft.copy_(eng._head_draft(h[self.ar, idx], self.out[self.ar, idx], T - 1))
 
 
 class _State:
@@ -328,7 +330,7 @@ class _State:
         r = self.runners.get((t, use_gemv))
         if r is None:
             if use_gemv == "head":
-                r = self.runners[(t, use_gemv)] = _HeadRunner(eng, self, eng.head_plan)
+                r = self.runners[(t, use_gemv)] = _HeadRunner(eng, self, eng.head_plan, t)
             elif isinstance(use_gemv, tuple):           # ("train", plan)
                 r = self.runners[(t, use_gemv)] = _TrainRunner(eng, self, use_gemv[1])
             else:
@@ -940,13 +942,17 @@ class Engine:
 
     # ------------------------------------------------------------ draft head
 
-    def _head_draft(self, h, g):
+    def _head_draft(self, h, g, k):
         """h [B, H] final hidden that produced token g [B] -> proposed token after g."""
-        x = torch.cat([h, F.embedding(g, self.embed) * self.head_escale], -1)
-        z = h + F.linear(F.silu(F.linear(x, self.head_a)), self.head_b)
-        return self.head_ids[torch.argmax(F.linear(z, self.head_lm), dim=-1)]
+        z, tok, outs = h, g, []
+        for _ in range(k):
+            x = torch.cat([z, F.embedding(tok, self.embed) * self.head_escale], -1)
+            z = z + F.linear(F.silu(F.linear(x, self.head_a)), self.head_b)
+            tok = self.head_ids[torch.argmax(F.linear(z, self.head_lm), dim=-1)]
+            outs.append(tok)
+        return torch.stack(outs, 1)
 
-    def _train_head(self, input_ids, plan):
+    def _train_head(self, input_ids, plan, chain):
         """Generate greedy continuations of pieces of the warmup prompt with the
         engine itself, then fit the head to predict the token after next."""
         t_start = time.perf_counter()
@@ -957,7 +963,7 @@ class Engine:
         gen = torch.Generator().manual_seed(0)
         prompt = torch.tensor(input_ids, dtype=torch.int64)
         keep, state = self.state, None
-        Hs, Ns, Ts = [], [], []
+        Hs, Ns, Ts, T2s = [], [], [], []
         try:
             self.state = None
             state = _State(self, Bt, -(-(slen + n + 2) // 128) * 128)
@@ -976,9 +982,10 @@ class Engine:
                     r.run(self, state)
                     hb[j].copy_(r.hbuf)             # hidden that produced tb[j + 1]
                     tb[j + 1].copy_(r.tok)
-                Hs.append(hb[:-1].reshape(-1, hb.shape[-1]).clone())
-                Ns.append(tb[1:-1].reshape(-1).clone())
-                Ts.append(tb[2:].reshape(-1).clone())
+                Hs.append(hb[:-2].reshape(-1, hb.shape[-1]).clone())
+                Ns.append(tb[1:-2].reshape(-1).clone())
+                Ts.append(tb[2:-1].reshape(-1).clone())
+                T2s.append(tb[3:].reshape(-1).clone())
         finally:
             del state
             self.state = keep
@@ -988,10 +995,11 @@ class Engine:
             H = torch.cat(Hs).clone()
             Nx = torch.cat(Ns).clone()
             Tg = torch.cat(Ts).clone()
+            Tg2 = torch.cat(T2s).clone()
             E = self.embed.detach()
             Hd = E.shape[1]
             escale = float(H.float().pow(2).mean().sqrt() / E[Nx[:4096]].float().pow(2).mean().sqrt())
-            seen = torch.unique(torch.cat([Tg, prompt.reshape(-1).to(dev)]))
+            seen = torch.unique(torch.cat([Tg, Tg2, prompt.reshape(-1).to(dev)]))
             mask = torch.ones((E.shape[0],), device=dev, dtype=torch.bool)
             mask[seen] = False
             fill = torch.nonzero(mask).reshape(-1)[:max(0, HEAD_VOCAB - seen.numel())]
@@ -999,7 +1007,7 @@ class Engine:
             Esub = E[ids].contiguous()
             remap = torch.zeros((E.shape[0],), device=dev, dtype=torch.int64)
             remap[ids] = torch.arange(ids.numel(), device=dev)
-            Tsub = remap[Tg]
+            Tsub, Tsub2 = remap[Tg], remap[Tg2]
             a = (torch.randn((Hd, 2 * Hd), device=dev) * (2 * Hd) ** -0.5).requires_grad_(True)
             b = torch.zeros((Hd, Hd), device=dev).requires_grad_(True)
             opt = torch.optim.AdamW([a, b], lr=1e-3, weight_decay=0.0)
@@ -1009,8 +1017,13 @@ class Engine:
                 idx = torch.randint(0, N, (4096,), device=dev)
                 h = H[idx]
                 x = torch.cat([h, E[Nx[idx]] * escale], -1)
-                z = h + F.linear(F.silu(F.linear(x, a.to(torch.bfloat16))), b.to(torch.bfloat16))
+                a16, b16 = a.to(torch.bfloat16), b.to(torch.bfloat16)
+                z = h + F.linear(F.silu(F.linear(x, a16)), b16)
                 loss = F.cross_entropy(F.linear(z, Esub).float(), Tsub[idx])
+                if chain:               # second chained draft: the head runs on its own output
+                    x2 = torch.cat([z, E[Tg[idx]] * escale], -1)
+                    z2 = z + F.linear(F.silu(F.linear(x2, a16)), b16)
+                    loss = loss + 0.5 * F.cross_entropy(F.linear(z2, Esub).float(), Tsub2[idx])
                 opt.zero_grad(set_to_none=True)
                 loss.backward()
                 for grp in opt.param_groups:
@@ -1023,7 +1036,7 @@ class Engine:
             self.head_a = a.detach().to(torch.bfloat16).contiguous()
             self.head_b = b.detach().to(torch.bfloat16).contiguous()
             self.head_escale = escale
-        del H, Nx, Tg, Hs, Ns, Ts
+        del H, Nx, Tg, Tg2, Hs, Ns, Ts, T2s
         torch.cuda.empty_cache()
         self.head_plan = plan
         _log(f"draft head: {N} samples gen {t_gen:.1f}s, {steps} steps loss {final_loss:.3f}, "
@@ -1033,7 +1046,8 @@ class Engine:
         """Train the head; keep head speculation if it beats the chosen mode on the warmup prompt."""
         t, g = st.mode
         plan = g if g in ("fixed", "fp8") else ("fp8" if self.fp8_dec_layers and st.batch >= 2 else "fixed")
-        self._train_head(input_ids, plan)
+        widths = [w for w in (2, 3) if w <= HEAD_T and (w == 2 or st.batch <= HEAD_T3_MAX_B)]
+        self._train_head(input_ids, plan, chain=max(widths) > 2)
 
         def timed(gen_fn):
             best = None
@@ -1052,12 +1066,17 @@ class Engine:
             base = timed(lambda: self._plain(st, ids, S, n, g))
         else:
             base = timed(lambda: self._spec(st, ids, input_ids, S, n, t, g))
-        stats = {}
-        head = timed(lambda: self._spec(st, ids, input_ids, S, n, 2, "head", stats))
-        acc = stats["accepted"] / max(1, stats["steps"]) / st.batch if stats else 0.0
-        _log(f"head speculation: {head * 1e3:.1f}ms (acc/step {acc:.2f}) vs {base * 1e3:.1f}ms {st.mode}")
-        if head < base * HEAD_MARGIN:
-            st.mode = (2, "head")
+        best_w, best_t, report = None, base * HEAD_MARGIN, []
+        for w in widths:
+            stats = {}
+            dt = timed(lambda: self._spec(st, ids, input_ids, S, n, w, "head", stats))
+            acc = stats["accepted"] / max(1, stats["steps"]) / st.batch if stats else 0.0
+            report.append(f"T={w}: {dt * 1e3:.1f}ms acc/step {acc:.2f}")
+            if dt < best_t:
+                best_w, best_t = w, dt
+        _log(f"head speculation: {'; '.join(report)} vs {base * 1e3:.1f}ms {st.mode} -> {best_w}")
+        if best_w is not None:
+            st.mode = (best_w, "head")
 
     # ------------------------------------------------------------ decode loops
 
@@ -1130,7 +1149,7 @@ class Engine:
         r.hlen.fill_(S + 1)
         r.lim.fill_(S + n)
         if isinstance(r, _HeadRunner):
-            r.draft.copy_(st.first)
+            r.draft.copy_(st.first.unsqueeze(1).expand_as(r.draft))
         if not self.cuda:
             yield st.first.tolist()
             emitted, steps = 1, 0
@@ -1321,7 +1340,7 @@ class Engine:
             return
         self._tg0 = time.perf_counter()
         B, S = len(input_ids), len(input_ids[0])
-        tmax = max(_spec_candidates(B))
+        tmax = max(max(_spec_candidates(B)), 4)
         self._ensure_rope(-(-(S + n + tmax) // 128) * 128 + 1)
         st = self._get_state(B, S + n + tmax)
         ids = torch.tensor(input_ids, dtype=torch.int64, device=self.device)
