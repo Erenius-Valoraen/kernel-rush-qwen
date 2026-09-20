@@ -80,6 +80,11 @@ HEAD_T = int(os.environ.get("ENGINE_HEAD_T", "3"))          # widest verify step
 HEAD_T3_MAX_B = 16          # wider verify steps cost too many rows beyond this batch
 HEAD_BATCH = int(os.environ.get("ENGINE_HEAD_BATCH", "256"))
 HEAD_STEPS = int(os.environ.get("ENGINE_HEAD_STEPS", "96"))
+# Workloads of one run share the container: keep the head and part of its training set
+# (warmup-prompt continuations only) so later workloads train on more varied text.
+HEAD_CACHE = os.environ.get("ENGINE_HEAD_CACHE", "/tmp/kernel_rush_head")
+HEAD_CACHE_KEEP = float(os.environ.get("ENGINE_HEAD_CACHE_KEEP", "0.6"))     # share of new samples kept
+HEAD_CACHE_MAX = int(os.environ.get("ENGINE_HEAD_CACHE_MAX", "600000"))     # samples
 HEAD_VOCAB = 32768
 HEAD_LR = float(os.environ.get("ENGINE_HEAD_LR", "1e-3"))
 HEAD_WD = float(os.environ.get("ENGINE_HEAD_WD", "0"))
@@ -91,7 +96,7 @@ LAST_LAYER_TRIM = os.environ.get("ENGINE_NO_TRIM") != "1"
 # prefill GEMMs run in FP8 (organisers allow FP8 compute); decode stays bf16
 FP8_SITES = tuple(filter(None, re.split("[,:]", os.environ.get("ENGINE_FP8", "gu"))))
 FP8_SKIP = tuple(int(v) for v in re.split("[,:]", os.environ.get("ENGINE_FP8_SKIP", "0:0")))   # leading, trailing bf16 layers
-FP8_DECODE = os.environ.get("ENGINE_FP8_DECODE", "1") == "1"   # gate/up + down in FP8 at decode, M >= 4
+FP8_DECODE = os.environ.get("ENGINE_FP8_DECODE", "0") == "1"   # gate/up + down in FP8 at decode, M >= 4
 FP8_DEC_SITES = tuple(re.split("[,:]", os.environ.get("ENGINE_FP8_DEC_SITES", "gu")))
 FP8_LM = os.environ.get("ENGINE_FP8_LM", "0") == "1"          # LM head in FP8 at decode
 FP8_SPEC_B1 = os.environ.get("ENGINE_FP8_SPEC_B1", "1") == "1"  # batch-1 verify steps use the fp8 plan
@@ -958,6 +963,41 @@ class Engine:
             outs.append(tok)
         return torch.stack(outs, 1)
 
+    def _head_cache_load(self):
+        if not HEAD_CACHE:
+            return None
+        try:
+            path = os.path.join(HEAD_CACHE, "state.pt")
+            if not os.path.exists(path):
+                return None
+            d = torch.load(path, map_location=self.device, weights_only=True)
+            if d["a"].shape != (self.embed.shape[1], 2 * self.embed.shape[1]):
+                return None
+            return d
+        except Exception as e:  # pragma: no cover
+            _log(f"head cache unreadable: {e!r}")
+            return None
+
+    def _head_cache_save(self, fresh, cached, a, b, escale):
+        if not HEAD_CACHE:
+            return
+        try:
+            os.makedirs(HEAD_CACHE, exist_ok=True)
+            H, Nx, Tg, Tg2 = fresh
+            k = int(H.shape[0] * HEAD_CACHE_KEEP)
+            idx = torch.randperm(H.shape[0], device=H.device)[:k]
+            keep = dict(H=H[idx], Nx=Nx[idx], Tg=Tg[idx], Tg2=Tg2[idx])
+            if cached is not None:
+                for key in keep:
+                    keep[key] = torch.cat([keep[key], cached[key]])[:HEAD_CACHE_MAX]
+            d = {key: v.cpu() for key, v in keep.items()}
+            d.update(a=a.cpu(), b=b.cpu(), escale=float(escale))
+            tmp = os.path.join(HEAD_CACHE, f"state.{os.getpid()}.tmp")
+            torch.save(d, tmp)
+            os.replace(tmp, os.path.join(HEAD_CACHE, "state.pt"))
+        except Exception as e:  # pragma: no cover
+            _log(f"head cache not saved: {e!r}")
+
     def _train_head(self, input_ids, plan, chain):
         """Generate greedy continuations of pieces of the warmup prompt with the
         engine itself, then fit the head to predict the token after next."""
@@ -1002,9 +1042,17 @@ class Engine:
             Nx = torch.cat(Ns).clone()
             Tg = torch.cat(Ts).clone()
             Tg2 = torch.cat(T2s).clone()
+            fresh = (H, Nx, Tg, Tg2)
+            cached = self._head_cache_load()
+            if cached is not None:
+                H = torch.cat([H, cached["H"]]); Nx = torch.cat([Nx, cached["Nx"]])
+                Tg = torch.cat([Tg, cached["Tg"]]); Tg2 = torch.cat([Tg2, cached["Tg2"]])
             E = self.embed.detach()
             Hd = E.shape[1]
-            escale = float(H.float().pow(2).mean().sqrt() / E[Nx[:4096]].float().pow(2).mean().sqrt())
+            if cached is not None:
+                escale = cached["escale"]
+            else:
+                escale = float(H[:65536].float().pow(2).mean().sqrt() / E[Nx[:4096]].float().pow(2).mean().sqrt())
             seen = torch.unique(torch.cat([Tg, Tg2, prompt.reshape(-1).to(dev)]))
             mask = torch.ones((E.shape[0],), device=dev, dtype=torch.bool)
             mask[seen] = False
@@ -1014,8 +1062,12 @@ class Engine:
             remap = torch.zeros((E.shape[0],), device=dev, dtype=torch.int64)
             remap[ids] = torch.arange(ids.numel(), device=dev)
             Tsub, Tsub2 = remap[Tg], remap[Tg2]
-            a = (torch.randn((Hd, 2 * Hd), device=dev) * (2 * Hd) ** -0.5).requires_grad_(True)
-            b = torch.zeros((Hd, Hd), device=dev).requires_grad_(True)
+            if cached is not None:
+                a = cached["a"].float().clone().requires_grad_(True)
+                b = cached["b"].float().clone().requires_grad_(True)
+            else:
+                a = (torch.randn((Hd, 2 * Hd), device=dev) * (2 * Hd) ** -0.5).requires_grad_(True)
+                b = torch.zeros((Hd, Hd), device=dev).requires_grad_(True)
             opt = torch.optim.AdamW([a, b], lr=HEAD_LR, weight_decay=HEAD_WD)
             t0 = time.perf_counter()
             steps, N = 0, H.shape[0]
@@ -1042,9 +1094,13 @@ class Engine:
             self.head_a = a.detach().to(torch.bfloat16).contiguous()
             self.head_b = b.detach().to(torch.bfloat16).contiguous()
             self.head_escale = escale
+            self._head_cache_save(fresh, cached, a.detach(), b.detach(), escale)
+            n_cached = 0 if cached is None else cached["H"].shape[0]
+            del fresh, cached
         del H, Nx, Tg, Tg2, Hs, Ns, Ts, T2s
         torch.cuda.empty_cache()
         self.head_plan = plan
+        _log(f"draft head cache: {n_cached} earlier samples")
         _log(f"draft head: {N} samples gen {t_gen:.1f}s, {steps} steps loss {final_loss:.3f}, "
              f"vocab {seen.numel()} seen, total {time.perf_counter() - t_start:.1f}s")
 
