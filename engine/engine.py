@@ -74,14 +74,17 @@ CALIB_REPS = int(os.environ.get("ENGINE_CALIB_REPS", "2"))   # timed repetitions
 # Draft head: a small MLP trained during warmup on the model's own greedy text
 # proposes the token after next; the model verifies it (exact greedy output).
 HEAD = os.environ.get("ENGINE_HEAD", "1") == "1"
-HEAD_TRAIN_S = float(os.environ.get("ENGINE_HEAD_TRAIN_S", "12"))
-HEAD_ROUNDS = int(os.environ.get("ENGINE_HEAD_ROUNDS", "8"))
+HEAD_TRAIN_S = float(os.environ.get("ENGINE_HEAD_TRAIN_S", "14"))
+HEAD_ROUNDS = int(os.environ.get("ENGINE_HEAD_ROUNDS", "10"))
 HEAD_T = int(os.environ.get("ENGINE_HEAD_T", "3"))          # widest verify step tried: 1 real token + T-1 chained drafts
 HEAD_T3_MAX_B = 16          # wider verify steps cost too many rows beyond this batch
 HEAD_BATCH = int(os.environ.get("ENGINE_HEAD_BATCH", "256"))
 HEAD_STEPS = int(os.environ.get("ENGINE_HEAD_STEPS", "96"))
 HEAD_VOCAB = 32768
-HEAD_MARGIN = 0.97            # head speculation must beat the plain mode by 3% on warmup
+HEAD_LR = float(os.environ.get("ENGINE_HEAD_LR", "1e-3"))
+HEAD_WD = float(os.environ.get("ENGINE_HEAD_WD", "0"))
+HEAD_MARGIN = 0.90            # warmup timing flatters the head (it trained on that prompt): demand 10%
+HEAD_MAX_B = 32               # larger batches: verify rows cost more than the drafts return
 WARMUP_DEADLINE_S = 180.0     # since __init__ began; the platform allows 300
 FUSED_ATTN = os.environ.get("ENGINE_UNFUSED_ATTN") != "1"
 LAST_LAYER_TRIM = os.environ.get("ENGINE_NO_TRIM") != "1"
@@ -1010,7 +1013,7 @@ class Engine:
             Tsub, Tsub2 = remap[Tg], remap[Tg2]
             a = (torch.randn((Hd, 2 * Hd), device=dev) * (2 * Hd) ** -0.5).requires_grad_(True)
             b = torch.zeros((Hd, Hd), device=dev).requires_grad_(True)
-            opt = torch.optim.AdamW([a, b], lr=1e-3, weight_decay=0.0)
+            opt = torch.optim.AdamW([a, b], lr=HEAD_LR, weight_decay=HEAD_WD)
             t0 = time.perf_counter()
             steps, N = 0, H.shape[0]
             while time.perf_counter() - t0 < HEAD_TRAIN_S:
@@ -1027,7 +1030,7 @@ class Engine:
                 opt.zero_grad(set_to_none=True)
                 loss.backward()
                 for grp in opt.param_groups:
-                    grp["lr"] = 1e-3 * max(0.05, 1 - (time.perf_counter() - t0) / HEAD_TRAIN_S)
+                    grp["lr"] = HEAD_LR * max(0.05, 1 - (time.perf_counter() - t0) / HEAD_TRAIN_S)
                 opt.step()
                 steps += 1
             final_loss = float(loss)
@@ -1239,7 +1242,7 @@ class Engine:
             modes += [(1, "fixed")]
             if self.fp8_dec_layers and B >= 2:
                 modes += [(1, "fp8")]
-            if self.pdl_ok and n >= 4 and not self.fp8_dec_layers and not self._late()                     and self._mega_matches(st, ids, S, steps=8, plan="fixedpdl", ref="fixed"):
+            if self.pdl_ok and n >= 4 and not self.fp8_dec_layers and not (HEAD and B <= HEAD_MAX_B and n >= 8 and S >= 16)                     and not self._late()                     and self._mega_matches(st, ids, S, steps=8, plan="fixedpdl", ref="fixed"):
                 modes += [(1, "fixedpdl")]
                 if os.environ.get("ENGINE_PDL_PEEL") == "1" and not self._late()                         and self._mega_matches(st, ids, S, steps=8, plan="fixedpdlpeel", ref="fixed"):
                     modes += [(1, "fixedpdlpeel")]
@@ -1260,6 +1263,9 @@ class Engine:
             modes = [m for m in modes if m[1] in ("fixed", "fp8")]
         spec_ts = [t for t in _spec_candidates(B) if t > 1 and n >= 16 and B <= 16
                    and os.environ.get("ENGINE_SPEC", "0") == "1"]
+        if HEAD and gemv_ok and B <= HEAD_MAX_B and n >= 8 and S >= 16:
+            # head speculation is timed against this plan next; skip the long plan survey
+            modes = [(1, "fixed")]
         best, best_time, report = (1, False), None, []
         pending = list(modes)
         while pending:
@@ -1348,7 +1354,7 @@ class Engine:
         if st.mode is None:
             if n > 1 and os.environ.get("ENGINE_NO_CALIBRATE") != "1":
                 self._calibrate(st, ids, input_ids, S, n)
-                if (HEAD and self.cuda and n >= 8 and S >= 16 and st.mode[1] is not False
+                if (HEAD and self.cuda and n >= 8 and S >= 16 and B <= HEAD_MAX_B and st.mode[1] is not False
                         and not self._late()):
                     try:
                         self._try_head(st, ids, input_ids, S, n)
