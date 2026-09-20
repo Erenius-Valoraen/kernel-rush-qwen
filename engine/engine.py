@@ -88,6 +88,8 @@ HEAD_CACHE_MAX = int(os.environ.get("ENGINE_HEAD_CACHE_MAX", "600000"))     # sa
 HEAD_VOCAB = 32768
 HEAD_LR = float(os.environ.get("ENGINE_HEAD_LR", "1e-3"))
 HEAD_WD = float(os.environ.get("ENGINE_HEAD_WD", "0"))
+TREE = os.environ.get("ENGINE_TREE", "1") == "1"
+TREE_MAX_B = int(os.environ.get("ENGINE_TREE_MAX_B", "8"))   # tree extra row not free beyond this batch
 HEAD_MARGIN = 0.90            # warmup timing flatters the head (it trained on that prompt): demand 10%
 HEAD_MAX_B = 32               # larger batches: verify rows cost more than the drafts return
 WARMUP_DEADLINE_S = 180.0     # since __init__ began; the platform allows 300
@@ -319,6 +321,72 @@ class _HeadRunner(_Runner):
         self.draft.copy_(eng._head_draft(h[self.ar, idx], self.out[self.ar, idx], T - 1))
 
 
+class _TreeHeadRunner(_Runner):
+    """Sparse-tree speculation, width 4. Slots [last,d1a,d2,d1b] at p0..p0+3;
+    d1b is the head's 2nd-best first token (self-slot mask skips d1a,d2)."""
+
+    RP = [0, 1, 2, 1]
+    PL = [0, 1, 2, 0]
+    SS = [0, 1, 2, 3]
+
+    def __init__(self, eng, st, plan):
+        super().__init__(eng, st, 4, plan)
+        B = st.batch
+        self.ar = torch.arange(B, device=eng.device)
+        self.d1a = torch.zeros((B,), device=eng.device, dtype=torch.int64)
+        self.d2 = torch.zeros((B,), device=eng.device, dtype=torch.int64)
+        self.d1b = torch.zeros((B,), device=eng.device, dtype=torch.int64)
+        if hasattr(self.attn, "set_tree"):
+            self.attn.set_tree(self.RP, self.PL, self.SS)
+
+    def reset_draft(self, first):
+        self.d1a.copy_(first); self.d2.copy_(first); self.d1b.copy_(first)
+
+    def step(self, eng, st):
+        B = st.batch
+        last = self.hist.gather(1, (self.hlen - 1).long().unsqueeze(1)).squeeze(1)
+        self.inp[:, 0] = last
+        self.inp[:, 1] = self.d1a
+        self.inp[:, 2] = self.d2
+        self.inp[:, 3] = self.d1b
+        self.pos.copy_(self.hlen - 1)                         # p0 = L-1
+        nxt = eng._forward_step(st, self.inp.view(-1), self.pos, 4, self.attn, self.use_gemv)
+        out = nxt.view(B, 4)
+        h = eng._last_h.view(B, 4, -1)
+        d1a, d2, d1b = self.inp[:, 1], self.inp[:, 2], self.inp[:, 3]
+        g1 = out[:, 0]
+        ma = g1 == d1a
+        mb = (~ma) & (g1 == d1b)
+        a2 = ma & (out[:, 1] == d2)
+        nacc = 1 + ma.long() * (1 + a2.long()) + mb.long()
+        base = self.hlen.long()                               # g1 -> position L = base
+        cap = self.lim.long()
+        tok1 = torch.where(mb, out[:, 3], out[:, 1])
+
+        def commit(off, tok, cond):
+            pos = base + off
+            ok = cond & (pos < cap)
+            idx = torch.where(ok, pos, torch.zeros_like(pos))
+            self.hist[self.ar, idx] = torch.where(ok, tok.to(torch.int32), self.hist[self.ar, idx])
+
+        commit(0, g1, torch.ones(B, dtype=torch.bool, device=self.ar.device))
+        commit(1, tok1, nacc >= 2)
+        commit(2, out[:, 2], nacc >= 3)
+        # b-branch: g1=d1b lives at slot p0+3 = L+2; its real position is L. Move it.
+        use = mb & (base < cap)
+        src = base + 2
+        for cache in (st.k_cache, st.v_cache):
+            sv = cache[:, self.ar, :, src, :]
+            cv = cache[:, self.ar, :, base, :]
+            cache[:, self.ar, :, base, :] = torch.where(use[:, None, None, None], sv, cv)
+        self.hlen.copy_(torch.minimum(base + nacc, cap).to(torch.int32))
+        row = torch.where(a2, torch.full_like(g1, 2),
+                          torch.where(ma, torch.ones_like(g1),
+                                      torch.where(mb, torch.full_like(g1, 3), torch.zeros_like(g1))))
+        nd1a, nd2, nd1b = eng._head_tree_draft(h[self.ar, row], out[self.ar, row])
+        self.d1a.copy_(nd1a); self.d2.copy_(nd2); self.d1b.copy_(nd1b)
+
+
 class _State:
     """KV cache and runners for one (batch, capacity) shape."""
 
@@ -340,7 +408,9 @@ class _State:
     def runner(self, eng, t, use_gemv):
         r = self.runners.get((t, use_gemv))
         if r is None:
-            if use_gemv == "head":
+            if use_gemv == "tree":
+                r = self.runners[(t, use_gemv)] = _TreeHeadRunner(eng, self, eng.head_plan)
+            elif use_gemv == "head":
                 r = self.runners[(t, use_gemv)] = _HeadRunner(eng, self, eng.head_plan, t)
             elif isinstance(use_gemv, tuple):           # ("train", plan)
                 r = self.runners[(t, use_gemv)] = _TrainRunner(eng, self, use_gemv[1])
@@ -953,6 +1023,20 @@ class Engine:
 
     # ------------------------------------------------------------ draft head
 
+    def _head_tree_draft(self, h, g):
+        """h [B,H] hidden that produced g [B] -> (d1a top1, d2 top1-after-d1a, d1b top2)."""
+        x = torch.cat([h, F.embedding(g, self.embed) * self.head_escale], -1)
+        z1 = h + F.linear(F.silu(F.linear(x, self.head_a)), self.head_b)
+        l1 = F.linear(z1, self.head_lm)
+        i1 = torch.argmax(l1, dim=-1)
+        l1b = l1.scatter(-1, i1[:, None], float("-inf"))
+        i2 = torch.argmax(l1b, dim=-1)
+        d1a, d1b = self.head_ids[i1], self.head_ids[i2]
+        x2 = torch.cat([z1, F.embedding(d1a, self.embed) * self.head_escale], -1)
+        z2 = z1 + F.linear(F.silu(F.linear(x2, self.head_a)), self.head_b)
+        d2 = self.head_ids[torch.argmax(F.linear(z2, self.head_lm), dim=-1)]
+        return d1a, d2, d1b
+
     def _head_draft(self, h, g, k):
         """h [B, H] final hidden that produced token g [B] -> proposed token after g."""
         z, tok, outs = h, g, []
@@ -1129,6 +1213,7 @@ class Engine:
         else:
             base = timed(lambda: self._spec(st, ids, input_ids, S, n, t, g))
         best_w, best_t, report = None, base * HEAD_MARGIN, []
+        self._tree_win = False
         for w in widths:
             stats = {}
             dt = timed(lambda: self._spec(st, ids, input_ids, S, n, w, "head", stats))
@@ -1136,9 +1221,16 @@ class Engine:
             report.append(f"T={w}: {dt * 1e3:.1f}ms acc/step {acc:.2f}")
             if dt < best_t:
                 best_w, best_t = w, dt
+        if TREE and st.batch <= TREE_MAX_B:
+            stats = {}
+            dt = timed(lambda: self._spec(st, ids, input_ids, S, n, 4, "tree", stats))
+            acc = stats["accepted"] / max(1, stats["steps"]) / st.batch if stats else 0.0
+            report.append(f"tree: {dt * 1e3:.1f}ms acc/step {acc:.2f}")
+            if dt < best_t:
+                best_w, best_t, self._tree_win = 4, dt, True
         _log(f"head speculation: {'; '.join(report)} vs {base * 1e3:.1f}ms {st.mode} -> {best_w}")
         if best_w is not None:
-            st.mode = (best_w, "head")
+            st.mode = (best_w, "tree" if self._tree_win else "head")
 
     # ------------------------------------------------------------ decode loops
 
@@ -1210,7 +1302,9 @@ class Engine:
         r.hist[:, S].copy_(st.first)
         r.hlen.fill_(S + 1)
         r.lim.fill_(S + n)
-        if isinstance(r, _HeadRunner):
+        if isinstance(r, _TreeHeadRunner):
+            r.reset_draft(st.first)
+        elif isinstance(r, _HeadRunner):
             r.draft.copy_(st.first.unsqueeze(1).expand_as(r.draft))
         if not self.cuda:
             yield st.first.tolist()
@@ -1420,6 +1514,8 @@ class Engine:
                     except Exception as e:  # pragma: no cover
                         _log(f"draft head unavailable: {e!r}")
                         self.state = st
+                if os.environ.get("ENGINE_FORCE_TREE") == "1" and getattr(self, "head_a", None) is not None:
+                    st.mode = (4, "tree")
             else:
                 st.mode = (int(os.environ.get("ENGINE_MODE", "1")),
                            os.environ.get("ENGINE_TEST_PLAN")

@@ -67,13 +67,20 @@ def _norm_rope_half(x1, x2, w_ptr, cos_ptr, sin_ptr, pos, offs_h, mask2,
 
 @triton.jit
 def _fused_attn_kernel(qkv_ptr, qw_ptr, kw_ptr, cos_ptr, sin_ptr,
-                       kc_ptr, vc_ptr, pos_ptr, o_ptr, m_ptr, l_ptr, cnt_ptr, out_ptr,
+                       kc_ptr, vc_ptr, pos_ptr, rp_ptr, pl_ptr, ss_ptr,
+                       o_ptr, m_ptr, l_ptr, cnt_ptr, out_ptr,
                        stride_cb, stride_ch, split_stride, scale, eps, CHUNK,
                        NKV: tl.constexpr, GROUP: tl.constexpr, T: tl.constexpr,
                        RPAD: tl.constexpr, TPAD: tl.constexpr, D: tl.constexpr,
                        BLOCK_N: tl.constexpr, NSPLIT: tl.constexpr, QSPLIT: tl.constexpr,
                        DOT_F32: tl.constexpr, FENCE: tl.constexpr = False,
-                       PDL: tl.constexpr = False):
+                       PDL: tl.constexpr = False, TREE: tl.constexpr = False,
+                       PSPAN: tl.constexpr = 0):
+    # TREE sparse-tree speculation. Tokens occupy contiguous slots p0+offs_t, but
+    # each has a logical RoPE position rp[i] (relative to p0) and attends
+    # keys (offs_n <= p0+pl[i]) OR (offs_n == p0+ss[i]) -- a contiguous prefix
+    # plus its own self slot, so a branch node skips its siblings' slots. Linear
+    # decode is rp=pl=ss=offs_t, PSPAN=T.
     z = pdl_wait(PDL)
     pdl_launch(PDL)
     pid = tl.program_id(0) + z
@@ -86,22 +93,26 @@ def _fused_attn_kernel(qkv_ptr, qw_ptr, kw_ptr, cos_ptr, sin_ptr,
     W: tl.constexpr = (NQ + 2 * NKV) * D
     p0 = tl.load(pos_ptr + b)
     start = split * CHUNK
-    end = tl.minimum(start + CHUNK, p0 + T)
+    end = tl.minimum(start + CHUNK, p0 + PSPAN)
     offs_h = tl.arange(0, HALF)
     offs_d = tl.arange(0, D)
     cache_base = b.to(tl.int64) * stride_cb + kvh * stride_ch
 
-    # ---- new K/V of the tokens whose positions fall in this split
+    # ---- new K/V: token i is stored at contiguous slot p0+i, roped at p0+rp[i]
     offs_t = tl.arange(0, TPAD)
-    tpos = p0 + offs_t
-    tmask = (offs_t < T) & (tpos >= start) & (tpos < end)
+    slot = p0 + offs_t
+    if TREE:
+        krope = p0 + tl.load(rp_ptr + offs_t, mask=offs_t < T, other=0)
+    else:
+        krope = slot
+    tmask = (offs_t < T) & (slot >= start) & (slot < end)
     tmask2 = tmask[:, None] & (offs_h[None, :] < HALF)
     trow = qkv_ptr + (b * T + offs_t)[:, None].to(tl.int64) * W
     kptr = trow + (NQ + kvh) * D + offs_h[None, :]
     k1 = _load_rows(kptr, 0, tmask2, QSPLIT, split_stride).to(tl.float32)
     k2 = _load_rows(kptr + HALF, 0, tmask2, QSPLIT, split_stride).to(tl.float32)
-    k1, k2 = _norm_rope_half(k1, k2, kw_ptr, cos_ptr, sin_ptr, tpos, offs_h, tmask2, eps, D, HALF)
-    dst = cache_base + tpos[:, None].to(tl.int64) * D + offs_h[None, :]
+    k1, k2 = _norm_rope_half(k1, k2, kw_ptr, cos_ptr, sin_ptr, krope, offs_h, tmask2, eps, D, HALF)
+    dst = cache_base + slot[:, None].to(tl.int64) * D + offs_h[None, :]
     tl.store(kc_ptr + dst, k1, mask=tmask2)
     tl.store(kc_ptr + dst + HALF, k2, mask=tmask2)
     vptr = trow + (NQ + NKV + kvh) * D + offs_h[None, :]
@@ -121,8 +132,15 @@ def _fused_attn_kernel(qkv_ptr, qw_ptr, kw_ptr, cos_ptr, sin_ptr,
             + (kvh * GROUP + g)[:, None] * D + offs_h[None, :])
     q1 = _load_rows(qptr, 0, rmask2, QSPLIT, split_stride).to(tl.float32)
     q2 = _load_rows(qptr + HALF, 0, rmask2, QSPLIT, split_stride).to(tl.float32)
-    qa, qb = _norm_rope_half(q1, q2, qw_ptr, cos_ptr, sin_ptr, p0 + j, offs_h, rmask2, eps, D, HALF)
-    limit = p0 + j
+    if TREE:
+        qrope = p0 + tl.load(rp_ptr + j, mask=rmask, other=0)
+        limit = p0 + tl.load(pl_ptr + j, mask=rmask, other=0)
+        sslot = p0 + tl.load(ss_ptr + j, mask=rmask, other=0)
+    else:
+        qrope = p0 + j
+        limit = p0 + j
+        sslot = p0 + j
+    qa, qb = _norm_rope_half(q1, q2, qw_ptr, cos_ptr, sin_ptr, qrope, offs_h, rmask2, eps, D, HALF)
 
     m_i = tl.full([RPAD], float("-inf"), tl.float32)
     l_i = tl.zeros([RPAD], tl.float32)
@@ -141,6 +159,8 @@ def _fused_attn_kernel(qkv_ptr, qw_ptr, kw_ptr, cos_ptr, sin_ptr,
             s += tl.dot(qb, tl.trans(kb))
         s = s * scale
         valid = nmask[None, :] & (offs_n[None, :] <= limit[:, None])
+        if TREE:
+            valid = valid | (nmask[None, :] & (offs_n[None, :] == sslot[:, None]))
         s = tl.where(valid, s, float("-inf"))
         m_new = tl.maximum(m_i, tl.max(s, axis=1))
         m_safe = tl.where(m_new == float("-inf"), 0.0, m_new)
@@ -208,6 +228,18 @@ class FusedDecodeAttention(DecodeAttention):
         self.tpad = max(2, triton.next_power_of_2(t))
         self.cfg = self.CONFIGS[0]
         self.tuned = False
+        self.tree = False
+        self.pspan = t
+        self.rp = self.pl = self.ss = torch.arange(t, device=device, dtype=torch.int32)
+
+    def set_tree(self, rp, pl, ss):
+        """Sparse tree: rp=logical RoPE offsets, pl=contiguous-prefix limits,
+        ss=self-slot offsets (all length t, relative to p0). Slots stay 0..t-1."""
+        dev = self.cnt.device
+        self.rp = torch.tensor(rp, device=dev, dtype=torch.int32)
+        self.pl = torch.tensor(pl, device=dev, dtype=torch.int32)
+        self.ss = torch.tensor(ss, device=dev, dtype=torch.int32)
+        self.tree = True
 
     def tune(self, qkv, q_w, k_w, cos, sin, k_cache, v_cache, pos_t, eps):
         """Pick the fastest config at the current positions (call outside graph
@@ -243,12 +275,13 @@ class FusedDecodeAttention(DecodeAttention):
         out = torch.empty((B * T, self.nq * self.d), device=qkv.device, dtype=torch.bfloat16)
         pdl.before_launch()
         _fused_attn_kernel[(B * self.nkv, self.nsplit)](
-            qkv, q_w, k_w, cos, sin, k_cache, v_cache, pos_t,
+            qkv, q_w, k_w, cos, sin, k_cache, v_cache, pos_t, self.rp, self.pl, self.ss,
             self.o, self.m, self.l, self.cnt, out,
             k_cache.stride(0), k_cache.stride(1), M * W, self.scale, eps, self.chunk,
             NKV=self.nkv, GROUP=self.group, T=T, RPAD=self.rpad, TPAD=self.tpad,
             D=self.d, BLOCK_N=self.cfg[0], NSPLIT=self.nsplit, QSPLIT=qsplit,
             DOT_F32=_DOT_F32, FENCE=_ATTN_FENCE, PDL=pdl.compiled(),
+            TREE=self.tree, PSPAN=self.pspan,
             num_warps=self.cfg[1], num_stages=self.cfg[2],
         )
         pdl.after_launch()
