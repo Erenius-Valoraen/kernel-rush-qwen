@@ -74,13 +74,13 @@ CALIB_REPS = int(os.environ.get("ENGINE_CALIB_REPS", "2"))   # timed repetitions
 # Draft head: a small MLP trained during warmup on the model's own greedy text
 # proposes the token after next; the model verifies it (exact greedy output).
 HEAD = os.environ.get("ENGINE_HEAD", "1") == "1"
-HEAD_TRAIN_S = float(os.environ.get("ENGINE_HEAD_TRAIN_S", "14"))
-HEAD_ROUNDS = int(os.environ.get("ENGINE_HEAD_ROUNDS", "10"))
+HEAD_TRAIN_S = float(os.environ.get("ENGINE_HEAD_TRAIN_S", "12"))
+HEAD_ROUNDS = int(os.environ.get("ENGINE_HEAD_ROUNDS", "8"))
 HEAD_T = int(os.environ.get("ENGINE_HEAD_T", "3"))          # widest verify step tried: 1 real token + T-1 chained drafts
 HEAD_T3_MAX_B = 16          # wider verify steps cost too many rows beyond this batch
 HEAD_BATCH = int(os.environ.get("ENGINE_HEAD_BATCH", "256"))
 HEAD_STEPS = int(os.environ.get("ENGINE_HEAD_STEPS", "96"))
-HEAD_VOCAB = 32768
+HEAD_VOCAB = int(os.environ.get("ENGINE_HEAD_VOCAB", "16384"))
 HEAD_LR = float(os.environ.get("ENGINE_HEAD_LR", "1e-3"))
 HEAD_WD = float(os.environ.get("ENGINE_HEAD_WD", "0"))
 HEAD_MARGIN = 0.90            # warmup timing flatters the head (it trained on that prompt): demand 10%
@@ -1054,7 +1054,7 @@ class Engine:
 
         def timed(gen_fn):
             best = None
-            for rep_i in range(3):
+            for rep_i in range(2):
                 self._sync()
                 t0 = time.perf_counter()
                 for _ in gen_fn():
@@ -1307,6 +1307,7 @@ class Engine:
         # Batch 1: a T=4 verify step costs ~1% more than a plain step on H100 and
         # yields >= 1 token, so speculation is always on (no warmup-prompt luck).
         if (B == 1 and n >= 8 and self.cuda and best[0] == 1 and best[1] is not False
+                and not (HEAD and S >= 16)
                 and os.environ.get("ENGINE_SPEC_ALWAYS", "1") == "1"):
             try:
                 t_spec = 8 if n >= 192 else 4      # longer outputs repeat more: deeper drafts pay
