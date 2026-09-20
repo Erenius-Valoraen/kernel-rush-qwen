@@ -84,6 +84,7 @@ HEAD_VOCAB = int(os.environ.get("ENGINE_HEAD_VOCAB", "16384"))
 HEAD_LR = float(os.environ.get("ENGINE_HEAD_LR", "1e-3"))
 HEAD_WD = float(os.environ.get("ENGINE_HEAD_WD", "0"))
 HEAD_MARGIN = 0.90            # warmup timing flatters the head (it trained on that prompt): demand 10%
+HEAD_MARGIN_SMALL = 0.97      # ... but at batch <= 8 there are few stragglers and the bias is small
 HEAD_MAX_B = 32               # larger batches: verify rows cost more than the drafts return
 WARMUP_DEADLINE_S = 180.0     # since __init__ began; the platform allows 300
 FUSED_ATTN = os.environ.get("ENGINE_UNFUSED_ATTN") != "1"
@@ -1069,7 +1070,7 @@ class Engine:
             base = timed(lambda: self._plain(st, ids, S, n, g))
         else:
             base = timed(lambda: self._spec(st, ids, input_ids, S, n, t, g))
-        best_w, best_t, report = None, base * HEAD_MARGIN, []
+        best_w, best_t, report = None, base * (HEAD_MARGIN_SMALL if st.batch <= 8 else HEAD_MARGIN), []
         for w in widths:
             stats = {}
             dt = timed(lambda: self._spec(st, ids, input_ids, S, n, w, "head", stats))
