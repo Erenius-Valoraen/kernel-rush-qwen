@@ -83,7 +83,8 @@ HEAD_STEPS = int(os.environ.get("ENGINE_HEAD_STEPS", "96"))
 HEAD_VOCAB = int(os.environ.get("ENGINE_HEAD_VOCAB", "16384"))
 HEAD_LR = float(os.environ.get("ENGINE_HEAD_LR", "1e-3"))
 HEAD_WD = float(os.environ.get("ENGINE_HEAD_WD", "0"))
-HEAD_MARGIN = 0.90            # warmup timing flatters the head (it trained on that prompt): demand 10%
+HEAD_MARGIN = 0.94            # warmup timing flatters the head (it trained on that prompt): demand 10%
+HEAD_KEEP = 1.0               # measured samples: keep the head only while it still beats the plain plan
 HEAD_MARGIN_SMALL = 0.97      # ... but at batch <= 8 there are few stragglers and the bias is small
 HEAD_MAX_B = 32               # larger batches: verify rows cost more than the drafts return
 WARMUP_DEADLINE_S = 180.0     # since __init__ began; the platform allows 300
@@ -1071,15 +1072,26 @@ class Engine:
         else:
             base = timed(lambda: self._spec(st, ids, input_ids, S, n, t, g))
         best_w, best_t, report = None, base * (HEAD_MARGIN_SMALL if st.batch <= 8 else HEAD_MARGIN), []
+        steps_w = {}
         for w in widths:
             stats = {}
             dt = timed(lambda: self._spec(st, ids, input_ids, S, n, w, "head", stats))
+            steps_w[w] = stats.get("steps", 0)
             acc = stats["accepted"] / max(1, stats["steps"]) / st.batch if stats else 0.0
             report.append(f"T={w}: {dt * 1e3:.1f}ms acc/step {acc:.2f}")
             if dt < best_t:
                 best_w, best_t = w, dt
         _log(f"head speculation: {'; '.join(report)} vs {base * 1e3:.1f}ms {st.mode} -> {best_w}")
         if best_w is not None:
+            # Keep what is needed to re-judge the head on real prompts: a measured
+            # sample's verify-step count gives its time under the head; compare with
+            # the plain plan and fall back if the warmup estimate was too kind.
+            self._sync()
+            t0 = time.perf_counter()
+            self._prefill(ids, st)
+            self._sync()
+            st.head_check = dict(base=base, base_mode=st.mode, pf=time.perf_counter() - t0,
+                                 t_head=best_t, steps=max(1, steps_w.get(best_w, 1)))
             st.mode = (best_w, "head")
 
     # ------------------------------------------------------------ decode loops
@@ -1378,9 +1390,16 @@ class Engine:
         if t == 1 or n == 1:
             gen = self._plain(st, ids, S, n, g)
         else:
-            gen = self._spec(st, ids, input_ids, S, n, t, g)
+            head_stats = {} if g == "head" else None
+            gen = self._spec(st, ids, input_ids, S, n, t, g, head_stats)
         if DIAG and st.calls > 1 and self.cuda:
             import diag
             pre, per = diag.sleeps(st.diag, st.calls - 1)
             gen = diag.wrap(gen, pre, per, n)
         yield from gen
+        chk = getattr(st, "head_check", None)
+        if chk is not None and t != 1 and n != 1 and g == "head" and head_stats and st.mode[1] == "head":
+            est = chk["pf"] + (chk["t_head"] - chk["pf"]) * head_stats["steps"] / chk["steps"]
+            if est > chk["base"] * HEAD_KEEP:
+                _log(f"head on real prompt: est {est * 1e3:.1f}ms vs plain {chk['base'] * 1e3:.1f}ms -> plain")
+                st.mode = chk["base_mode"]
