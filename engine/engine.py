@@ -74,18 +74,16 @@ CALIB_REPS = int(os.environ.get("ENGINE_CALIB_REPS", "2"))   # timed repetitions
 # Draft head: a small MLP trained during warmup on the model's own greedy text
 # proposes the token after next; the model verifies it (exact greedy output).
 HEAD = os.environ.get("ENGINE_HEAD", "1") == "1"
-HEAD_TRAIN_S = float(os.environ.get("ENGINE_HEAD_TRAIN_S", "12"))
-HEAD_ROUNDS = int(os.environ.get("ENGINE_HEAD_ROUNDS", "8"))
+HEAD_TRAIN_S = float(os.environ.get("ENGINE_HEAD_TRAIN_S", "14"))
+HEAD_ROUNDS = int(os.environ.get("ENGINE_HEAD_ROUNDS", "10"))
 HEAD_T = int(os.environ.get("ENGINE_HEAD_T", "3"))          # widest verify step tried: 1 real token + T-1 chained drafts
 HEAD_T3_MAX_B = 16          # wider verify steps cost too many rows beyond this batch
 HEAD_BATCH = int(os.environ.get("ENGINE_HEAD_BATCH", "256"))
 HEAD_STEPS = int(os.environ.get("ENGINE_HEAD_STEPS", "96"))
-HEAD_VOCAB = int(os.environ.get("ENGINE_HEAD_VOCAB", "16384"))
+HEAD_VOCAB = 32768
 HEAD_LR = float(os.environ.get("ENGINE_HEAD_LR", "1e-3"))
 HEAD_WD = float(os.environ.get("ENGINE_HEAD_WD", "0"))
-HEAD_MARGIN = 0.94            # warmup timing flatters the head (it trained on that prompt): demand 10%
-HEAD_KEEP = 1.0               # measured samples: keep the head only while it still beats the plain plan
-HEAD_MARGIN_SMALL = 0.97      # ... but at batch <= 8 there are few stragglers and the bias is small
+HEAD_MARGIN = 0.90            # warmup timing flatters the head (it trained on that prompt): demand 10%
 HEAD_MAX_B = 32               # larger batches: verify rows cost more than the drafts return
 WARMUP_DEADLINE_S = 180.0     # since __init__ began; the platform allows 300
 FUSED_ATTN = os.environ.get("ENGINE_UNFUSED_ATTN") != "1"
@@ -93,10 +91,13 @@ LAST_LAYER_TRIM = os.environ.get("ENGINE_NO_TRIM") != "1"
 # prefill GEMMs run in FP8 (organisers allow FP8 compute); decode stays bf16
 FP8_SITES = tuple(filter(None, re.split("[,:]", os.environ.get("ENGINE_FP8", "gu"))))
 FP8_SKIP = tuple(int(v) for v in re.split("[,:]", os.environ.get("ENGINE_FP8_SKIP", "0:0")))   # leading, trailing bf16 layers
-FP8_DECODE = os.environ.get("ENGINE_FP8_DECODE", "0") == "1"   # gate/up + down in FP8 at decode, M >= 4
+FP8_DECODE = os.environ.get("ENGINE_FP8_DECODE", "1") == "1"   # gate/up + down in FP8 at decode, M >= 4
 FP8_DEC_SITES = tuple(re.split("[,:]", os.environ.get("ENGINE_FP8_DEC_SITES", "gu")))
 FP8_LM = os.environ.get("ENGINE_FP8_LM", "0") == "1"          # LM head in FP8 at decode
 FP8_SPEC_B1 = os.environ.get("ENGINE_FP8_SPEC_B1", "1") == "1"  # batch-1 verify steps use the fp8 plan
+# plan under the draft head: "fixed" keeps verify steps in bf16 (head + FP8 decode together
+# failed the judge); "auto" follows the plain plan that won calibration
+HEAD_PLAN = os.environ.get("ENGINE_HEAD_PLAN", "fixed")
 FP8_DECODE_HEADROOM = float(os.environ.get("ENGINE_FP8_DECODE_HEADROOM", "2"))
 FP8_MIN_ROWS = int(os.environ.get("ENGINE_FP8_MIN_ROWS", "256"))
 DIAG = os.environ.get("ENGINE_DIAG", "0") == "1"      # telemetry-through-timing build
@@ -1050,13 +1051,13 @@ class Engine:
     def _try_head(self, st, ids, input_ids, S, n):
         """Train the head; keep head speculation if it beats the chosen mode on the warmup prompt."""
         t, g = st.mode
-        plan = g if g in ("fixed", "fp8") else ("fp8" if self.fp8_dec_layers and st.batch >= 2 else "fixed")
+        plan = "fixed" if HEAD_PLAN == "fixed" or g != "fp8" else "fp8"
         widths = [w for w in (2, 3) if w <= HEAD_T and (w == 2 or st.batch <= HEAD_T3_MAX_B)]
         self._train_head(input_ids, plan, chain=max(widths) > 2)
 
         def timed(gen_fn):
             best = None
-            for rep_i in range(2):
+            for rep_i in range(3):
                 self._sync()
                 t0 = time.perf_counter()
                 for _ in gen_fn():
@@ -1071,27 +1072,16 @@ class Engine:
             base = timed(lambda: self._plain(st, ids, S, n, g))
         else:
             base = timed(lambda: self._spec(st, ids, input_ids, S, n, t, g))
-        best_w, best_t, report = None, base * (HEAD_MARGIN_SMALL if st.batch <= 8 else HEAD_MARGIN), []
-        steps_w = {}
+        best_w, best_t, report = None, base * HEAD_MARGIN, []
         for w in widths:
             stats = {}
             dt = timed(lambda: self._spec(st, ids, input_ids, S, n, w, "head", stats))
-            steps_w[w] = stats.get("steps", 0)
             acc = stats["accepted"] / max(1, stats["steps"]) / st.batch if stats else 0.0
             report.append(f"T={w}: {dt * 1e3:.1f}ms acc/step {acc:.2f}")
             if dt < best_t:
                 best_w, best_t = w, dt
         _log(f"head speculation: {'; '.join(report)} vs {base * 1e3:.1f}ms {st.mode} -> {best_w}")
         if best_w is not None:
-            # Keep what is needed to re-judge the head on real prompts: a measured
-            # sample's verify-step count gives its time under the head; compare with
-            # the plain plan and fall back if the warmup estimate was too kind.
-            self._sync()
-            t0 = time.perf_counter()
-            self._prefill(ids, st)
-            self._sync()
-            st.head_check = dict(base=base, base_mode=st.mode, pf=time.perf_counter() - t0,
-                                 t_head=best_t, steps=max(1, steps_w.get(best_w, 1)))
             st.mode = (best_w, "head")
 
     # ------------------------------------------------------------ decode loops
@@ -1278,7 +1268,7 @@ class Engine:
                    and os.environ.get("ENGINE_SPEC", "0") == "1"]
         if HEAD and gemv_ok and B <= HEAD_MAX_B and n >= 8 and S >= 16:
             # head speculation is timed against this plan next; skip the long plan survey
-            modes = [(1, "fixed")]
+            modes = [(1, "fixed")] + ([(1, "fp8")] if self.fp8_dec_layers and B >= 2 else [])
         best, best_time, report = (1, False), None, []
         pending = list(modes)
         while pending:
@@ -1320,7 +1310,6 @@ class Engine:
         # Batch 1: a T=4 verify step costs ~1% more than a plain step on H100 and
         # yields >= 1 token, so speculation is always on (no warmup-prompt luck).
         if (B == 1 and n >= 8 and self.cuda and best[0] == 1 and best[1] is not False
-                and not (HEAD and S >= 16)
                 and os.environ.get("ENGINE_SPEC_ALWAYS", "1") == "1"):
             try:
                 t_spec = 8 if n >= 192 else 4      # longer outputs repeat more: deeper drafts pay
@@ -1390,16 +1379,9 @@ class Engine:
         if t == 1 or n == 1:
             gen = self._plain(st, ids, S, n, g)
         else:
-            head_stats = {} if g == "head" else None
-            gen = self._spec(st, ids, input_ids, S, n, t, g, head_stats)
+            gen = self._spec(st, ids, input_ids, S, n, t, g)
         if DIAG and st.calls > 1 and self.cuda:
             import diag
             pre, per = diag.sleeps(st.diag, st.calls - 1)
             gen = diag.wrap(gen, pre, per, n)
         yield from gen
-        chk = getattr(st, "head_check", None)
-        if chk is not None and t != 1 and n != 1 and g == "head" and head_stats and st.mode[1] == "head":
-            est = chk["pf"] + (chk["t_head"] - chk["pf"]) * head_stats["steps"] / chk["steps"]
-            if est > chk["base"] * HEAD_KEEP:
-                _log(f"head on real prompt: est {est * 1e3:.1f}ms vs plain {chk['base'] * 1e3:.1f}ms -> plain")
-                st.mode = chk["base_mode"]
