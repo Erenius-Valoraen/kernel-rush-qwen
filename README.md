@@ -1,12 +1,11 @@
 # Qwen3-4B fast decode engine — 1st place, Dryft Kernel Rush @ Hack the North
 
-A from-scratch inference engine that makes **Qwen3-4B** generate text **4–7× faster than stock
-HuggingFace Transformers** on a single NVIDIA H100 — without changing a single token of its output.
+A from-scratch inference engine for **Qwen3-4B** greedy decoding on a single NVIDIA H100. It is
+competitive with vLLM (faster at batch 1 and 16) and runs **4–6× faster than native HuggingFace
+Transformers**, without changing a single token of the model's output.
 
 Built for **Dryft's Kernel Rush** track at Hack the North. Final result: **1,470.8 tokens/sec,
-1st of 56 teams** (2nd place: 1,291).
-
-![Final leaderboard](assets/leaderboard.png)
+1st of 56 teams**.
 
 ## The challenge
 
@@ -21,10 +20,12 @@ So this is pure latency work against a hard correctness wall.
 
 ## Results
 
-The engine reaches 4–7× native Transformers throughput on the public workloads, with identical
-output:
+Greedy decode throughput against two engines people actually use — native HuggingFace Transformers
+and vLLM — on the three public workloads. Same model, same H100, identical greedy output. vLLM and
+Transformers were measured directly; this engine's numbers are from the official competition run
+(`tokens/sec = batch × output ÷ total time`, prefill included).
 
-![Throughput vs native Transformers](assets/vs_transformers.png)
+![Throughput vs common inference engines](assets/vs_engines.png)
 
 It got there in stages, each one a separate idea:
 
